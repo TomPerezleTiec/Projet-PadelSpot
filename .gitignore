@@ -1,0 +1,12 @@
+# Data files (excluded from GitHub)
+data/
+
+# Local virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Jupyter
+.ipynb_checkpoints/
