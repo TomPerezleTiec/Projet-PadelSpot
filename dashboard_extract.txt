@@ -1,0 +1,3858 @@
+--- CELL 1 ---
+"""
+Initialisation Spark optimisée pour le traitement local DVF.
+- Exécution locale sur tous les cœurs disponibles.
+- 4 Go de mémoire driver.
+- Arrow activé pour accélérer les conversions éventuelles vers Pandas.
+"""
+from pyspark.sql import SparkSession
+import pyspark.sql.functions as F
+
+spark = SparkSession.builder \
+    .appName("PadelSpot_Step1_DVF") \
+    .master("local[*]") \
+    .config("spark.driver.memory", "4g") \
+    .config("spark.sql.execution.arrow.pyspark.enabled", "true") \
+    .getOrCreate()
+
+# Réduction du bruit de logs pour le notebook
+spark.sparkContext.setLogLevel("WARN")
+spark
+--- CELL 2 ---
+"""
+Lecture unifiée des fichiers DVF avec schéma explicite.
+- Le CSV DVF contient plus de colonnes que celles utiles au projet.
+- On construit un schéma explicite StringType à partir de l'en-tête (pas d'inferSchema).
+- On projette ensuite uniquement les 9 colonnes utiles.
+"""
+from pyspark.sql.types import StructType, StructField, StringType
+import glob
+
+# Colonnes utiles demandées pour l'étape 1
+required_cols = [
+    "Date mutation",
+    "Valeur fonciere",
+    "Code postal",
+    "Code departement",
+    "Code commune",
+    "Type local",
+    "Surface reelle bati",
+    "Longitude",
+    "Latitude",
+]
+
+# Recherche robuste des fichiers DVF selon les deux organisations possibles
+patterns = [
+    "/home/jovyan/work/data/dvf/*.txt",
+    "/home/jovyan/work/data/valeursfoncieres-*/*.txt",
+]
+dvf_paths = sorted({path for pattern in patterns for path in glob.glob(pattern)})
+
+if not dvf_paths:
+    raise FileNotFoundError(
+        "Aucun fichier DVF trouvé dans /home/jovyan/work/data/dvf/ ou /home/jovyan/work/data/valeursfoncieres-*/"
+    )
+
+print("📂 Fichiers DVF détectés :")
+for path in dvf_paths:
+    print(f" - {path}")
+
+# Construction d'un schéma explicite complet (StringType) à partir de l'en-tête du 1er fichier
+header_line = spark.read.text(dvf_paths[0]).limit(1).collect()[0][0]
+all_cols = header_line.split("|")
+full_schema = StructType([StructField(col_name, StringType(), True) for col_name in all_cols])
+
+# Lecture de tous les fichiers avec séparateur explicite et schéma explicite (sans inferSchema)
+df_dvf_full = spark.read \
+    .option("header", True) \
+    .option("sep", "|") \
+    .schema(full_schema) \
+    .csv(dvf_paths)
+
+# Certains jeux DVF historiques ne contiennent pas Longitude/Latitude
+has_gps_columns = ("Longitude" in df_dvf_full.columns) and ("Latitude" in df_dvf_full.columns)
+if not has_gps_columns:
+    print("⚠️ Colonnes GPS absentes dans les sources DVF : Longitude/Latitude ajoutées à null.")
+    df_dvf_full = df_dvf_full \
+        .withColumn("Longitude", F.lit(None).cast("string")) \
+        .withColumn("Latitude", F.lit(None).cast("string"))
+
+# Projection finale sur les 9 colonnes utiles
+df_dvf_raw = df_dvf_full.select(*required_cols)
+
+print(f"📊 Nombre brut de lignes DVF : {df_dvf_raw.count()}")
+print(f"🛰️ Colonnes GPS présentes dans les fichiers source : {has_gps_columns}")
+df_dvf_raw.printSchema()
+--- CELL 3 ---
+"""
+Nettoyage métier des transactions DVF ciblées.
+- Conversion des formats décimaux français (virgule -> point).
+- Cast numérique des montants/surfaces/coordonnées.
+- Filtrage du type de local, de la surface et des valeurs aberrantes.
+- Si GPS disponible : filtrage France métropolitaine + exclusion des coordonnées nulles.
+"""
+# Normalisation des colonnes texte pouvant contenir une virgule décimale
+df_dvf_clean = df_dvf_raw \
+    .withColumn("valeur_fonciere_str", F.regexp_replace(F.col("Valeur fonciere"), ",", ".")) \
+    .withColumn("surface_reelle_bati_str", F.regexp_replace(F.col("Surface reelle bati"), ",", ".")) \
+    .withColumn("longitude_str", F.regexp_replace(F.col("Longitude"), ",", ".")) \
+    .withColumn("latitude_str", F.regexp_replace(F.col("Latitude"), ",", "."))
+
+# Cast explicite vers types numériques
+df_dvf_clean = df_dvf_clean.select(
+    F.col("Date mutation").alias("date_mutation"),
+    F.col("Code postal").alias("code_postal"),
+    F.col("Code departement").alias("code_departement"),
+    F.col("Code commune").alias("code_commune"),
+    F.col("Type local").alias("type_local"),
+    F.col("valeur_fonciere_str").cast("double").alias("valeur_fonciere"),
+    F.col("surface_reelle_bati_str").cast("double").alias("surface_reelle_bati"),
+    F.col("longitude_str").cast("double").alias("longitude"),
+    F.col("latitude_str").cast("double").alias("latitude")
+)
+
+# Filtres métier de base (indépendants des coordonnées)
+base_filter = (
+    (F.col("type_local") == "Local industriel. commercial ou assimilé") &
+    F.col("valeur_fonciere").isNotNull() &
+    F.col("surface_reelle_bati").isNotNull() &
+    (F.col("valeur_fonciere") > 0) &
+    (F.col("surface_reelle_bati") > 200) &
+    (F.col("surface_reelle_bati") > 0)
+)
+
+# Filtres GPS uniquement si les colonnes existaient réellement en source
+if has_gps_columns:
+    gps_filter = (
+        F.col("latitude").isNotNull() &
+        F.col("longitude").isNotNull() &
+        F.col("latitude").between(41.0, 51.5) &
+        F.col("longitude").between(-5.0, 10.0)
+)
+else:
+    print("⚠️ Filtre GPS ignoré : les colonnes Longitude/Latitude ne sont pas présentes dans les DVF source.")
+    gps_filter = F.lit(True)
+
+df_dvf_clean = df_dvf_clean.filter(base_filter & gps_filter)
+
+# Calcul du prix au m²
+df_dvf_clean = df_dvf_clean.withColumn(
+    "prix_m2",
+    F.col("valeur_fonciere") / F.col("surface_reelle_bati")
+)
+
+print(f"📦 Transactions DVF nettoyées : {df_dvf_clean.count()}")
+df_dvf_clean.select("code_departement", "code_commune", "valeur_fonciere", "surface_reelle_bati", "prix_m2").show(10, truncate=False)
+--- CELL 4 ---
+"""
+Agrégation des transactions DVF par commune et sauvegarde des résultats.
+- Calcul du prix médian au m² via percentile_approx (robuste au volume).
+- Calcul du nombre de transactions commerciales par commune.
+- Sauvegarde en Parquet partitionné par code_departement.
+"""
+# Agrégation par commune (avec le département conservé pour la partition de sortie)
+df_dvf_commune = df_dvf_clean.groupBy("code_departement", "code_commune").agg(
+    F.expr("percentile_approx(prix_m2, 0.5, 10000)").alias("prix_median_m2"),
+    F.count("*").alias("nb_transactions")
+)
+
+# Tri optionnel pour lecture rapide
+df_dvf_commune = df_dvf_commune.orderBy(F.desc("nb_transactions"))
+
+# Sauvegarde finale en Parquet partitionné
+output_path_dvf = "/home/jovyan/work/data/output/dvf_clean/"
+df_dvf_commune.write \
+    .mode("overwrite") \
+    .partitionBy("code_departement") \
+    .parquet(output_path_dvf)
+
+print(f"✅ DVF agrégé sauvegardé dans : {output_path_dvf}")
+print(f"📊 Nombre de communes (lignes agrégées) : {df_dvf_commune.count()}")
+df_dvf_commune.show(10, truncate=False)
+--- CELL 6 ---
+"""
+Initialisation Spark optimisée pour l'étape 2 (Filosofi).
+- Exécution locale sur tous les cœurs disponibles (local[*]).
+- 4 Go mémoire driver.
+- Arrow activé pour accélérer les transferts Pandas UDF.
+"""
+from pyspark.sql import SparkSession
+import pyspark.sql.functions as F
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType
+import glob
+
+spark = SparkSession.builder \
+    .appName("PadelSpot_Step2_Filosofi") \
+    .master("local[*]") \
+    .config("spark.driver.memory", "4g") \
+    .config("spark.sql.execution.arrow.pyspark.enabled", "true") \
+    .getOrCreate()
+
+# Réduction du bruit dans le notebook
+spark.sparkContext.setLogLevel("WARN")
+spark
+--- CELL 7 ---
+"""
+Lecture multi-fichiers Filosofi avec schéma explicite + nettoyage métier.
+- Schéma explicite (StringType) construit depuis l'en-tête source (pas d'inferSchema).
+- Support des variantes de colonnes (majuscules/minuscules) entre millésimes.
+- Nettoyage : carreaux valides, population et revenus positifs, cast en DoubleType.
+"""
+# Colonnes utiles canoniques
+filosofi_cols = [
+    "IdINSPIRE",
+    "code_commune_insee",
+    "I_est_cr",
+    "Ind",
+    "Ind_snv",
+    "Men_pauv",
+    "Ind_18_24",
+    "Ind_25_39",
+    "I_pauv",
+    "X_c",
+    "Y_c",
+]
+
+# Recherche robuste des fichiers dans les structures possibles
+patterns = [
+    "/home/jovyan/work/data/filosofi/Filosofi2021_carreaux_200m_csv/*.csv",
+    "/home/jovyan/work/data/Filosofi2021_carreaux_200m_csv/*.csv",
+]
+filosofi_paths = sorted({path for pattern in patterns for path in glob.glob(pattern)})
+
+if not filosofi_paths:
+    raise FileNotFoundError(
+        "Aucun CSV Filosofi trouvé dans /home/jovyan/work/data/filosofi/Filosofi2021_carreaux_200m_csv/ "
+        "ou /home/jovyan/work/data/Filosofi2021_carreaux_200m_csv/"
+    )
+
+print("📂 Fichiers Filosofi détectés :")
+for path in filosofi_paths[:10]:
+    print(f" - {path}")
+if len(filosofi_paths) > 10:
+    print(f"... ({len(filosofi_paths)} fichiers au total)")
+
+# Détection du séparateur réel à partir de l'en-tête
+header_line = spark.read.text(filosofi_paths[0]).limit(1).collect()[0][0]
+sep = ";" if ";" in header_line else ","
+all_cols = header_line.split(sep)
+
+# Schéma explicite complet (tout en StringType)
+filosofi_full_schema = StructType([StructField(col_name, StringType(), True) for col_name in all_cols])
+
+# Lecture multi-fichiers avec séparateur détecté et schéma explicite
+df_filosofi_full = spark.read \
+    .option("header", True) \
+    .option("sep", sep) \
+    .schema(filosofi_full_schema) \
+    .csv(filosofi_paths)
+
+# Mapping des noms de colonnes possibles vers les noms canoniques attendus
+col_candidates = {
+    "IdINSPIRE": ["IdINSPIRE", "idcar_200m"],
+    "code_commune_insee": ["code_commune_insee", "lcog_geo", "Code commune", "code_commune"],
+    "I_est_cr": ["I_est_cr", "i_est_200"],
+    "Ind": ["Ind", "ind"],
+    "Ind_snv": ["Ind_snv", "ind_snv"],
+    "Men_pauv": ["Men_pauv", "men_pauv"],
+    "Ind_18_24": ["Ind_18_24", "ind_18_24"],
+    "Ind_25_39": ["Ind_25_39", "ind_25_39"],
+    "I_pauv": ["I_pauv", "i_pauv", "tx_pauv"],
+    "X_c": ["X_c", "x_c"],
+    "Y_c": ["Y_c", "y_c"],
+}
+
+resolved = {}
+for canonical, candidates in col_candidates.items():
+    resolved_name = next((name for name in candidates if name in df_filosofi_full.columns), None)
+    if resolved_name is not None:
+        resolved[canonical] = resolved_name
+
+if "IdINSPIRE" not in resolved:
+    raise ValueError("Impossible d'identifier la colonne IdINSPIRE/idcar_200m dans les CSV Filosofi.")
+
+# Projection canonique minimale
+df_filosofi_raw = df_filosofi_full.select(
+    F.col(resolved["IdINSPIRE"]).alias("IdINSPIRE"),
+    F.col(resolved["code_commune_insee"]).alias("code_commune_insee") if "code_commune_insee" in resolved else F.lit(None).alias("code_commune_insee"),
+    F.col(resolved["I_est_cr"]).alias("I_est_cr") if "I_est_cr" in resolved else F.lit(None).alias("I_est_cr"),
+    F.col(resolved["Ind"]).alias("Ind") if "Ind" in resolved else F.lit(None).alias("Ind"),
+    F.col(resolved["Ind_snv"]).alias("Ind_snv") if "Ind_snv" in resolved else F.lit(None).alias("Ind_snv"),
+    F.col(resolved["Men_pauv"]).alias("Men_pauv") if "Men_pauv" in resolved else F.lit(None).alias("Men_pauv"),
+    F.col(resolved["Ind_18_24"]).alias("Ind_18_24") if "Ind_18_24" in resolved else F.lit(None).alias("Ind_18_24"),
+    F.col(resolved["Ind_25_39"]).alias("Ind_25_39") if "Ind_25_39" in resolved else F.lit(None).alias("Ind_25_39"),
+    F.col(resolved["I_pauv"]).alias("I_pauv") if "I_pauv" in resolved else F.lit(None).alias("I_pauv"),
+    F.col(resolved["X_c"]).alias("X_c") if "X_c" in resolved else F.lit(None).alias("X_c"),
+    F.col(resolved["Y_c"]).alias("Y_c") if "Y_c" in resolved else F.lit(None).alias("Y_c")
+)
+
+# Fallback coordonnées : extraction depuis IdINSPIRE/idcar_200m (pattern ...N<Y>E<X>)
+if "X_c" not in resolved or "Y_c" not in resolved:
+    df_filosofi_raw = df_filosofi_raw \
+        .withColumn("Y_c", F.coalesce(F.col("Y_c"), F.regexp_extract(F.col("IdINSPIRE"), "N([0-9]+)E", 1))) \
+        .withColumn("X_c", F.coalesce(F.col("X_c"), F.regexp_extract(F.col("IdINSPIRE"), "E([0-9]+)", 1)))
+
+# Normalisation décimale éventuelle (virgule -> point) + cast DoubleType robuste (try_cast)
+numeric_cols = ["I_est_cr", "Ind", "Ind_snv", "Men_pauv", "Ind_18_24", "Ind_25_39", "I_pauv", "X_c", "Y_c"]
+df_filosofi_clean = df_filosofi_raw
+for col_name in numeric_cols:
+    df_filosofi_clean = df_filosofi_clean.withColumn(
+        col_name,
+        F.expr(f"try_cast(regexp_replace(`{col_name}`, ',', '.') as double)")
+    )
+
+# Nettoyage demandé : carreaux valides + population/revenus positifs
+df_filosofi_clean = df_filosofi_clean.filter(
+    (F.col("I_est_cr") == 1.0) &
+    F.col("Ind").isNotNull() & (F.col("Ind") > 0) &
+    F.col("Ind_snv").isNotNull() & (F.col("Ind_snv") > 0) &
+    F.col("X_c").isNotNull() & F.col("Y_c").isNotNull()
+)
+
+print(f"🧭 Séparateur détecté : '{sep}'")
+print(f"🧩 Mapping colonnes retenu : {resolved}")
+print(f"📊 Lignes brutes Filosofi : {df_filosofi_raw.count()}")
+print(f"✅ Lignes après nettoyage : {df_filosofi_clean.count()}")
+df_filosofi_clean.select("IdINSPIRE", "code_commune_insee", "I_est_cr", "Ind", "Ind_snv", "X_c", "Y_c").show(10, truncate=False)
+--- CELL 8 ---
+"""
+Conversion des coordonnées EPSG:3035 vers WGS84 via Pandas UDF vectorisé Arrow.
+- Utilise pyproj.Transformer dans la fonction UDF (import local à la UDF).
+- Évite les UDF Python ligne par ligne (beaucoup plus lentes).
+"""
+import importlib.util
+import subprocess
+import sys
+import pandas as pd
+
+# Installation automatique de pyproj si nécessaire (sans import global de pyproj)
+if importlib.util.find_spec("pyproj") is None:
+    print("📦 Installation de pyproj...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "pyproj"] )
+
+@F.pandas_udf("struct<Longitude:double,Latitude:double>")
+def epsg3035_to_wgs84(x_series: pd.Series, y_series: pd.Series) -> pd.DataFrame:
+    # Import local imposé dans la UDF (contrainte performance/propreté demandée)
+    from pyproj import Transformer
+
+    # Cache du transformer au niveau worker pour éviter une réinstanciation à chaque batch
+    if not hasattr(epsg3035_to_wgs84, "_transformer"):
+        epsg3035_to_wgs84._transformer = Transformer.from_crs(
+            "EPSG:3035", "EPSG:4326", always_xy=True
+        )
+
+    lon, lat = epsg3035_to_wgs84._transformer.transform(x_series.values, y_series.values)
+    return pd.DataFrame({"Longitude": lon, "Latitude": lat})
+
+# Application vectorisée de la conversion
+df_filosofi_geo = df_filosofi_clean.withColumn(
+    "wgs84",
+    epsg3035_to_wgs84(F.col("X_c"), F.col("Y_c"))
+).withColumn("Longitude", F.col("wgs84.Longitude")) \
+ .withColumn("Latitude", F.col("wgs84.Latitude")) \
+ .drop("wgs84")
+
+# Filtre de cohérence géographique (France métropolitaine)
+df_filosofi_geo = df_filosofi_geo.filter(
+    F.col("Latitude").between(41.0, 51.5) &
+    F.col("Longitude").between(-5.5, 10.5)
+)
+
+print(f"🛰️ Lignes après conversion + filtre géographique : {df_filosofi_geo.count()}")
+df_filosofi_geo.select("IdINSPIRE", "Longitude", "Latitude").show(10, truncate=False)
+--- CELL 9 ---
+"""
+Feature engineering + extraction code_departement + sauvegarde parquet partitionnée.
+- part_cible_padel = (Ind_18_24 + Ind_25_39) / Ind
+- score_revenu = normalisation Min-Max de Ind_snv dans [0, 1]
+- code_departement dérivé prioritairement depuis le code commune INSEE (lcog_geo).
+"""
+# 1) Variables dérivées métier
+df_filosofi_feat = df_filosofi_geo.withColumn(
+    "part_cible_padel",
+    (F.coalesce(F.col("Ind_18_24"), F.lit(0.0)) + F.coalesce(F.col("Ind_25_39"), F.lit(0.0))) / F.col("Ind")
+)
+
+# 2) Normalisation Min-Max du revenu
+stats_row = df_filosofi_feat.agg(
+    F.min("Ind_snv").alias("min_revenu"),
+    F.max("Ind_snv").alias("max_revenu")
+).collect()[0]
+
+min_revenu = float(stats_row["min_revenu"]) if stats_row["min_revenu"] is not None else 0.0
+max_revenu = float(stats_row["max_revenu"]) if stats_row["max_revenu"] is not None else 0.0
+
+if max_revenu > min_revenu:
+    df_filosofi_feat = df_filosofi_feat.withColumn(
+        "score_revenu",
+        (F.col("Ind_snv") - F.lit(min_revenu)) / F.lit(max_revenu - min_revenu)
+    )
+else:
+    df_filosofi_feat = df_filosofi_feat.withColumn("score_revenu", F.lit(0.0))
+
+# 3) Extraction robuste du code département
+code_commune_norm = F.upper(F.trim(F.col("code_commune_insee")))
+
+# Cas Corse (2A/2B), DOM (971-976), Métropole (01-95)
+dep_from_commune = F.when(
+    code_commune_norm.rlike("^(2A|2B)"), F.regexp_extract(code_commune_norm, "^(2A|2B)", 1)
+).when(
+    code_commune_norm.rlike("^(97[1-6])"), F.regexp_extract(code_commune_norm, "^(97[1-6])", 1)
+).otherwise(
+    F.regexp_extract(code_commune_norm, "^(0[1-9]|[1-8][0-9]|9[0-5])", 1)
+)
+
+# Fallback secondaire depuis IdINSPIRE (si code_commune absent)
+dep_regex_1 = F.regexp_extract(F.col("IdINSPIRE"), r"(?:^|[_-])((?:0[1-9]|[1-8][0-9]|9[0-5]|2A|2B))(?:[_-]|$)", 1)
+dep_regex_2 = F.regexp_extract(F.col("IdINSPIRE"), r"^FR(?:MET|DOM)?([0-9A-B]{2,3})", 1)
+
+df_filosofi_feat = df_filosofi_feat.withColumn(
+    "code_departement",
+    F.when(F.length(dep_from_commune) > 0, dep_from_commune)
+     .when(F.length(dep_regex_1) > 0, dep_regex_1)
+     .when(F.length(dep_regex_2) > 0, F.substring(dep_regex_2, 1, 2))
+     .otherwise(F.lit(None).cast(StringType()))
+)
+
+# Filtrage final des départements valides (métropole + Corse + DOM)
+df_filosofi_final = df_filosofi_feat.filter(
+    F.col("code_departement").rlike("^(0[1-9]|[1-8][0-9]|9[0-5]|2A|2B|97[1-6])$")
+)
+
+# 4) Sauvegarde partitionnée
+output_path_filosofi = "/home/jovyan/work/data/output/filosofi_clean/"
+df_filosofi_final.write \
+    .mode("overwrite") \
+    .partitionBy("code_departement") \
+    .parquet(output_path_filosofi)
+
+print(f"✅ Filosofi nettoyé sauvegardé dans : {output_path_filosofi}")
+print(f"📊 Nombre de carreaux finaux : {df_filosofi_final.count()}")
+print("📦 Répartition par département (top 20):")
+df_filosofi_final.groupBy("code_departement").count().orderBy(F.desc("count")).show(20, truncate=False)
+
+df_filosofi_final.select(
+    "IdINSPIRE", "code_commune_insee", "code_departement", "Ind", "Ind_snv",
+    "part_cible_padel", "score_revenu", "Longitude", "Latitude"
+).show(10, truncate=False)
+--- CELL 11 ---
+"""
+Section 4.1 — Parsing OSM PBF via pyosmium (ULTRA optimisé).
+- Sous-processus dédié (kernel Jupyter protégé).
+- Écriture streaming + fichiers temporaires atomiques (.tmp -> .csv).
+- Parsing en 2 passes :
+  1) arrêts TC (nodes) sans index de localisation
+  2) axes routiers (ways) avec index flex_mem (plus rapide)
+- Visualisateur d'avancement live dans le notebook.
+"""
+import os
+import importlib.util
+import subprocess
+import sys
+import textwrap
+import time
+from IPython.display import clear_output
+
+input_pbf = "/home/jovyan/work/data/france-260319.osm.pbf"
+output_transport_csv = "/home/jovyan/work/data/output/osm_transport_stops.csv"
+output_road_csv = "/home/jovyan/work/data/output/osm_road_axes.csv"
+parser_script_path = "/home/jovyan/work/data/output/osm_parse_streaming.py"
+
+# Installation automatique si nécessaire (runtime notebook)
+if importlib.util.find_spec("osmium") is None:
+    print("📦 Installation de pyosmium...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "osmium"])
+
+if importlib.util.find_spec("numpy") is None:
+    print("📦 Installation de numpy...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "numpy"])
+
+if not os.path.exists(input_pbf):
+    raise FileNotFoundError(f"Fichier PBF introuvable: {input_pbf}")
+
+# Re-parse uniquement si les CSV intermédiaires n'existent pas
+if (not os.path.exists(output_transport_csv)) or (not os.path.exists(output_road_csv)):
+    os.makedirs("/home/jovyan/work/data/output", exist_ok=True)
+
+    parser_code = textwrap.dedent("""
+    import csv
+    import os
+    import sys
+
+    pbf_path = sys.argv[1]
+    transport_csv_path = sys.argv[2]
+    road_csv_path = sys.argv[3]
+
+    transport_tmp = transport_csv_path + ".tmp"
+    road_tmp = road_csv_path + ".tmp"
+
+    class OSMAccessibilityExtractor:
+        def run(self):
+            import osmium
+            import numpy as np
+
+            os.makedirs(os.path.dirname(transport_csv_path), exist_ok=True)
+
+            # -----------------------------
+            # PASS 1 : Stops transport (nodes)
+            # -----------------------------
+            class TransportStopsHandler(osmium.SimpleHandler):
+                def __init__(self):
+                    super().__init__()
+                    # Contrainte projet : imports dans le handler
+                    import osmium as osmium_local
+                    import numpy as numpy_local
+                    self.osmium_local = osmium_local
+                    self.numpy_local = numpy_local
+
+                    self.f_tc = open(transport_tmp, "w", newline="", encoding="utf-8")
+                    self.writer_tc = csv.DictWriter(
+                        self.f_tc,
+                        fieldnames=["osm_id", "type_transport", "latitude", "longitude"]
+                    )
+                    self.writer_tc.writeheader()
+
+                    self.transport_count = 0
+                    self.node_seen = 0
+
+                def node(self, node):
+                    self.node_seen += 1
+                    if self.node_seen % 2_000_000 == 0:
+                        self.f_tc.flush()
+                        print(f"PROGRESS|pass1|{self.node_seen}|{self.transport_count}", flush=True)
+
+                    if not node.location.valid():
+                        return
+
+                    tags = node.tags
+                    type_transport = None
+                    if tags.get("highway") == "bus_stop":
+                        type_transport = "bus_stop"
+                    elif tags.get("railway") == "station":
+                        type_transport = "station"
+                    elif tags.get("railway") == "tram_stop":
+                        type_transport = "tram_stop"
+                    elif tags.get("railway") == "subway_entrance":
+                        type_transport = "subway_entrance"
+                    elif tags.get("public_transport") == "stop_position":
+                        type_transport = "stop_position"
+
+                    if type_transport is not None:
+                        self.writer_tc.writerow({
+                            "osm_id": int(node.id),
+                            "type_transport": type_transport,
+                            "latitude": float(node.location.lat),
+                            "longitude": float(node.location.lon),
+                        })
+                        self.transport_count += 1
+
+                def close(self):
+                    self.f_tc.flush()
+                    self.f_tc.close()
+
+            print("STATUS|pass1_start", flush=True)
+            h1 = TransportStopsHandler()
+            try:
+                # locations=False : plus rapide pour les nodes
+                h1.apply_file(pbf_path, locations=False)
+            finally:
+                h1.close()
+            print(f"STATUS|pass1_done|{h1.transport_count}", flush=True)
+
+            # -----------------------------
+            # PASS 2 : Axes routiers (ways)
+            # -----------------------------
+            class RoadAxesHandler(osmium.SimpleHandler):
+                def __init__(self):
+                    super().__init__()
+                    # Contrainte projet : imports dans le handler
+                    import osmium as osmium_local
+                    import numpy as numpy_local
+                    self.osmium_local = osmium_local
+                    self.np = numpy_local
+
+                    self.f_rd = open(road_tmp, "w", newline="", encoding="utf-8")
+                    self.writer_rd = csv.DictWriter(
+                        self.f_rd,
+                        fieldnames=["osm_id", "type_voie", "latitude_centroid", "longitude_centroid"]
+                    )
+                    self.writer_rd.writeheader()
+
+                    self.road_count = 0
+                    self.way_seen = 0
+                    self.skipped_ways_without_nodes = 0
+
+                def way(self, way):
+                    self.way_seen += 1
+                    if self.way_seen % 300_000 == 0:
+                        self.f_rd.flush()
+                        print(f"PROGRESS|pass2|{self.way_seen}|{self.road_count}", flush=True)
+
+                    highway = way.tags.get("highway")
+                    if highway not in {"motorway", "trunk", "primary"}:
+                        return
+
+                    lat_sum = 0.0
+                    lon_sum = 0.0
+                    count = 0
+                    for n in way.nodes:
+                        if n.location.valid():
+                            lat_sum += float(n.location.lat)
+                            lon_sum += float(n.location.lon)
+                            count += 1
+
+                    if count == 0:
+                        self.skipped_ways_without_nodes += 1
+                        return
+
+                    lat_c = float(self.np.float64(lat_sum / count))
+                    lon_c = float(self.np.float64(lon_sum / count))
+
+                    self.writer_rd.writerow({
+                        "osm_id": int(way.id),
+                        "type_voie": highway,
+                        "latitude_centroid": lat_c,
+                        "longitude_centroid": lon_c,
+                    })
+                    self.road_count += 1
+
+                def close(self):
+                    self.f_rd.flush()
+                    self.f_rd.close()
+
+            print("STATUS|pass2_start", flush=True)
+            h2 = RoadAxesHandler()
+            try:
+                # idx=flex_mem : rapide si RAM suffisante
+                h2.apply_file(pbf_path, locations=True, idx="flex_mem")
+            finally:
+                h2.close()
+
+            print(f"STATUS|pass2_done|{h2.road_count}|{h2.skipped_ways_without_nodes}", flush=True)
+
+            # Remplacement atomique des sorties
+            os.replace(transport_tmp, transport_csv_path)
+            os.replace(road_tmp, road_csv_path)
+
+            print(f"DONE|{h1.transport_count}|{h2.road_count}|{h2.skipped_ways_without_nodes}", flush=True)
+            print(f"PATH|transport|{transport_csv_path}", flush=True)
+            print(f"PATH|roads|{road_csv_path}", flush=True)
+
+    if __name__ == "__main__":
+        OSMAccessibilityExtractor().run()
+    """)
+
+    with open(parser_script_path, "w", encoding="utf-8") as f_script:
+        f_script.write(parser_code)
+
+    cmd = [sys.executable, parser_script_path, input_pbf, output_transport_csv, output_road_csv]
+    print("🚀 Lancement du parsing OSM ULTRA optimisé (2 passes + progress live)...")
+
+    state = {
+        "phase": "init",
+        "pass1_seen": 0,
+        "pass1_kept": 0,
+        "pass2_seen": 0,
+        "pass2_kept": 0,
+        "skipped_ways": 0,
+        "last_lines": []
+    }
+    start_ts = time.time()
+
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1
+    )
+
+    try:
+        for raw_line in process.stdout:
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            state["last_lines"].append(line)
+            state["last_lines"] = state["last_lines"][-8:]
+
+            if line.startswith("STATUS|pass1_start"):
+                state["phase"] = "PASS 1/2 - Stops transport"
+            elif line.startswith("STATUS|pass2_start"):
+                state["phase"] = "PASS 2/2 - Axes routiers"
+            elif line.startswith("PROGRESS|pass1|"):
+                _, _, seen, kept = line.split("|")
+                state["pass1_seen"] = int(seen)
+                state["pass1_kept"] = int(kept)
+                state["phase"] = "PASS 1/2 - Stops transport"
+            elif line.startswith("PROGRESS|pass2|"):
+                _, _, seen, kept = line.split("|")
+                state["pass2_seen"] = int(seen)
+                state["pass2_kept"] = int(kept)
+                state["phase"] = "PASS 2/2 - Axes routiers"
+            elif line.startswith("STATUS|pass2_done|"):
+                parts = line.split("|")
+                state["pass2_kept"] = int(parts[2])
+                state["skipped_ways"] = int(parts[3])
+            elif line.startswith("DONE|"):
+                _, tc, rd, skipped = line.split("|")
+                state["pass1_kept"] = int(tc)
+                state["pass2_kept"] = int(rd)
+                state["skipped_ways"] = int(skipped)
+                state["phase"] = "TERMINÉ"
+
+            elapsed = int(time.time() - start_ts)
+            clear_output(wait=True)
+            print("📡 Visualiseur d'avancement OSM")
+            print(f"Phase              : {state['phase']}")
+            print(f"Temps écoulé       : {elapsed//3600:02d}:{(elapsed%3600)//60:02d}:{elapsed%60:02d}")
+            print(f"Nodes lus (pass1)  : {state['pass1_seen']:,}")
+            print(f"Arrêts extraits    : {state['pass1_kept']:,}")
+            print(f"Ways lus (pass2)   : {state['pass2_seen']:,}")
+            print(f"Axes extraits      : {state['pass2_kept']:,}")
+            print(f"Ways sans nodes    : {state['skipped_ways']:,}")
+            print("\nDerniers logs:")
+            for msg in state["last_lines"]:
+                print(f" - {msg}")
+
+        return_code = process.wait()
+        if return_code != 0:
+            raise subprocess.CalledProcessError(return_code, cmd)
+
+        clear_output(wait=True)
+        print("✅ Parsing OSM terminé")
+        print(f" - Arrêts TC   : {state['pass1_kept']:,}")
+        print(f" - Axes routes : {state['pass2_kept']:,}")
+        print(f" - Ways ignorés: {state['skipped_ways']:,}")
+        print(f" - CSV transport: {output_transport_csv}")
+        print(f" - CSV routes   : {output_road_csv}")
+    finally:
+        if process.stdout:
+            process.stdout.close()
+else:
+    print("✅ CSV OSM intermédiaires déjà présents, parsing ignoré.")
+    print(f" - {output_transport_csv}")
+    print(f" - {output_road_csv}")
+--- CELL 12 ---
+"""
+Section 4.2 — Ingestion Spark des CSV OSM avec schémas explicites.
+- Chargement des arrêts TC et axes routiers extraits par pyosmium.
+- Schémas stricts (pas d'inferSchema).
+- Nettoyage minimal des coordonnées nulles.
+- Compatible avec un kernel redémarré (sans exécuter la section 4.1).
+"""
+import os
+from pyspark.sql import SparkSession
+import pyspark.sql.functions as F
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType, LongType
+
+# Fallback Spark si kernel redémarré
+if "spark" not in globals() or spark is None:
+    spark = SparkSession.builder \
+        .appName("PadelSpot_Step4_Accessibilite") \
+        .master("local[*]") \
+        .config("spark.driver.memory", "4g") \
+        .config("spark.sql.execution.arrow.pyspark.enabled", "true") \
+        .getOrCreate()
+    spark.sparkContext.setLogLevel("WARN")
+
+# Fallback chemins CSV si la section 4.1 n'a pas été exécutée dans ce kernel
+if "output_transport_csv" not in globals():
+    output_transport_csv = "/home/jovyan/work/data/output/osm_transport_stops.csv"
+if "output_road_csv" not in globals():
+    output_road_csv = "/home/jovyan/work/data/output/osm_road_axes.csv"
+
+if not os.path.exists(output_transport_csv) or not os.path.exists(output_road_csv):
+    raise FileNotFoundError(
+        "CSV OSM introuvables. Vérifie que les fichiers existent dans /home/jovyan/work/data/output/."
+    )
+
+transport_schema = StructType([
+    StructField("osm_id", LongType(), True),
+    StructField("type_transport", StringType(), True),
+    StructField("latitude", DoubleType(), True),
+    StructField("longitude", DoubleType(), True),
+])
+
+road_schema = StructType([
+    StructField("osm_id", LongType(), True),
+    StructField("type_voie", StringType(), True),
+    StructField("latitude_centroid", DoubleType(), True),
+    StructField("longitude_centroid", DoubleType(), True),
+])
+
+df_osm_transport = spark.read \
+    .option("header", True) \
+    .schema(transport_schema) \
+    .csv(output_transport_csv) \
+    .filter(
+        F.col("latitude").isNotNull() &
+        F.col("longitude").isNotNull()
+    )
+
+df_osm_roads = spark.read \
+    .option("header", True) \
+    .schema(road_schema) \
+    .csv(output_road_csv) \
+    .filter(
+        F.col("latitude_centroid").isNotNull() &
+        F.col("longitude_centroid").isNotNull()
+    )
+
+print(f"🚌 Arrêts TC chargés : {df_osm_transport.count()}")
+print(f"🛣️ Axes routiers chargés : {df_osm_roads.count()}")
+df_osm_transport.show(5, truncate=False)
+df_osm_roads.show(5, truncate=False)
+--- CELL 13 ---
+"""
+Section 4.3 — Calcul d'accessibilité par carreau INSEE.
+- Charge les carreaux de l'étape 2 (filosofi_clean).
+- Calcule densite_tc (arrêts TC à <=1 km).
+- Calcule proximite_axe (distance minimale à un axe majeur).
+- Utilise une Pandas UDF Haversine vectorisée (Arrow).
+"""
+import pandas as pd
+
+@F.pandas_udf("double")
+def haversine_km(lat1: pd.Series, lon1: pd.Series, lat2: pd.Series, lon2: pd.Series) -> pd.Series:
+    # Calcul vectorisé Haversine en km
+    import numpy as np
+    r = 6371.0
+    lat1_rad = np.radians(lat1.values)
+    lon1_rad = np.radians(lon1.values)
+    lat2_rad = np.radians(lat2.values)
+    lon2_rad = np.radians(lon2.values)
+    dlat = lat2_rad - lat1_rad
+    dlon = lon2_rad - lon1_rad
+    a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1_rad) * np.cos(lat2_rad) * np.sin(dlon / 2.0) ** 2
+    c = 2.0 * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a))
+    return pd.Series(r * c)
+
+# Chargement des carreaux nettoyés (Étape 2)
+df_carreaux = spark.read.parquet("/home/jovyan/work/data/output/filosofi_clean/") \
+    .select(
+        "IdINSPIRE", "code_departement", "code_commune_insee",
+        "Latitude", "Longitude", "Ind", "Ind_snv",
+        "part_cible_padel", "score_revenu"
+    ) \
+    .filter(F.col("Latitude").isNotNull() & F.col("Longitude").isNotNull())
+
+# -------------------------
+# 1) Densité transport (<= 1 km)
+# -------------------------
+bucket_deg_tc = 0.01  # ~1.1 km en latitude
+df_tc_b = df_osm_transport \
+    .select(
+        F.col("osm_id").alias("osm_id_tc"),
+        F.col("latitude").alias("lat_tc"),
+        F.col("longitude").alias("lon_tc")
+    ) \
+    .withColumn("lat_b", F.floor(F.col("lat_tc") / F.lit(bucket_deg_tc)).cast("int")) \
+    .withColumn("lon_b", F.floor(F.col("lon_tc") / F.lit(bucket_deg_tc)).cast("int"))
+
+df_c_b = df_carreaux \
+    .select(
+        "IdINSPIRE",
+        F.col("Latitude").alias("lat_cell"),
+        F.col("Longitude").alias("lon_cell")
+    ) \
+    .withColumn("lat_b", F.floor(F.col("lat_cell") / F.lit(bucket_deg_tc)).cast("int")) \
+    .withColumn("lon_b", F.floor(F.col("lon_cell") / F.lit(bucket_deg_tc)).cast("int"))
+
+# Expansion des buckets voisins (3x3) pour jointure spatiale approximative
+neighbors_tc = F.array(*[
+    F.struct(
+        (F.col("lat_b") + F.lit(dlat)).alias("lat_b_n"),
+        (F.col("lon_b") + F.lit(dlon)).alias("lon_b_n")
+    )
+    for dlat in [-1, 0, 1]
+    for dlon in [-1, 0, 1]
+])
+
+df_c_tc_candidates = df_c_b \
+    .withColumn("nb", F.explode(neighbors_tc)) \
+    .select(
+        "IdINSPIRE", "lat_cell", "lon_cell",
+        F.col("nb.lat_b_n").alias("lat_b_n"),
+        F.col("nb.lon_b_n").alias("lon_b_n")
+    )
+
+df_tc_pairs = df_c_tc_candidates.join(
+    df_tc_b,
+    (df_c_tc_candidates["lat_b_n"] == df_tc_b["lat_b"]) &
+    (df_c_tc_candidates["lon_b_n"] == df_tc_b["lon_b"]),
+    how="left"
+)
+
+df_tc_pairs = df_tc_pairs.withColumn(
+    "dist_tc_km",
+    haversine_km(
+        F.col("lat_cell"), F.col("lon_cell"),
+        F.col("lat_tc"), F.col("lon_tc")
+    )
+ )
+
+df_densite_tc = df_tc_pairs.filter(F.col("dist_tc_km") <= 1.0) \
+    .groupBy("IdINSPIRE") \
+    .agg(F.countDistinct("osm_id_tc").alias("densite_tc"))
+
+# -------------------------
+# 2) Proximité axe routier (distance min)
+# -------------------------
+bucket_deg_rd = 0.02  # bucket plus large pour limiter les cas sans candidats
+df_rd_b = df_osm_roads \
+    .select(
+        F.col("osm_id").alias("osm_id_rd"),
+        F.col("latitude_centroid").alias("lat_rd"),
+        F.col("longitude_centroid").alias("lon_rd")
+    ) \
+    .withColumn("lat_b", F.floor(F.col("lat_rd") / F.lit(bucket_deg_rd)).cast("int")) \
+    .withColumn("lon_b", F.floor(F.col("lon_rd") / F.lit(bucket_deg_rd)).cast("int"))
+
+df_c_r_b = df_carreaux \
+    .select(
+        "IdINSPIRE",
+        F.col("Latitude").alias("lat_cell"),
+        F.col("Longitude").alias("lon_cell")
+    ) \
+    .withColumn("lat_b", F.floor(F.col("lat_cell") / F.lit(bucket_deg_rd)).cast("int")) \
+    .withColumn("lon_b", F.floor(F.col("lon_cell") / F.lit(bucket_deg_rd)).cast("int"))
+
+# Expansion voisins 5x5 (±2 buckets)
+neighbors_rd = F.array(*[
+    F.struct(
+        (F.col("lat_b") + F.lit(dlat)).alias("lat_b_n"),
+        (F.col("lon_b") + F.lit(dlon)).alias("lon_b_n")
+    )
+    for dlat in [-2, -1, 0, 1, 2]
+    for dlon in [-2, -1, 0, 1, 2]
+])
+
+df_c_rd_candidates = df_c_r_b \
+    .withColumn("nb", F.explode(neighbors_rd)) \
+    .select(
+        "IdINSPIRE", "lat_cell", "lon_cell",
+        F.col("nb.lat_b_n").alias("lat_b_n"),
+        F.col("nb.lon_b_n").alias("lon_b_n")
+    )
+
+df_rd_pairs = df_c_rd_candidates.join(
+    df_rd_b,
+    (df_c_rd_candidates["lat_b_n"] == df_rd_b["lat_b"]) &
+    (df_c_rd_candidates["lon_b_n"] == df_rd_b["lon_b"]),
+    how="left"
+)
+
+df_rd_pairs = df_rd_pairs.withColumn(
+    "dist_axe_km",
+    haversine_km(
+        F.col("lat_cell"), F.col("lon_cell"),
+        F.col("lat_rd"), F.col("lon_rd")
+    )
+ )
+
+df_proximite_axe = df_rd_pairs \
+    .groupBy("IdINSPIRE") \
+    .agg(F.min("dist_axe_km").alias("proximite_axe"))
+
+# -------------------------
+# 3) Fusion indicateurs + score
+# -------------------------
+df_access = df_carreaux \
+    .join(df_densite_tc, on="IdINSPIRE", how="left") \
+    .join(df_proximite_axe, on="IdINSPIRE", how="left")
+
+# Gestion valeurs manquantes
+df_access = df_access.withColumn("densite_tc", F.coalesce(F.col("densite_tc"), F.lit(0)))
+
+max_prox_row = df_access.agg(F.max("proximite_axe").alias("max_prox")).collect()[0]
+max_prox_value = float(max_prox_row["max_prox"]) if max_prox_row["max_prox"] is not None else 50.0
+df_access = df_access.withColumn(
+    "proximite_axe",
+    F.coalesce(F.col("proximite_axe"), F.lit(max_prox_value + 5.0))
+)
+
+# Normalisation Min-Max densité
+stat_dens = df_access.agg(F.min("densite_tc").alias("min_d"), F.max("densite_tc").alias("max_d")).collect()[0]
+min_d, max_d = float(stat_dens["min_d"]), float(stat_dens["max_d"])
+if max_d > min_d:
+    df_access = df_access.withColumn(
+        "densite_tc_norm",
+        (F.col("densite_tc") - F.lit(min_d)) / F.lit(max_d - min_d)
+    )
+else:
+    df_access = df_access.withColumn("densite_tc_norm", F.lit(0.0))
+
+# Normalisation Min-Max proximité
+stat_prox = df_access.agg(F.min("proximite_axe").alias("min_p"), F.max("proximite_axe").alias("max_p")).collect()[0]
+min_p, max_p = float(stat_prox["min_p"]), float(stat_prox["max_p"])
+if max_p > min_p:
+    df_access = df_access.withColumn(
+        "proximite_axe_norm",
+        (F.col("proximite_axe") - F.lit(min_p)) / F.lit(max_p - min_p)
+    )
+else:
+    df_access = df_access.withColumn("proximite_axe_norm", F.lit(0.0))
+
+# Formule finale
+df_access = df_access.withColumn(
+    "score_accessibilite",
+    F.lit(0.6) * F.col("densite_tc_norm") + F.lit(0.4) * (F.lit(1.0) - F.col("proximite_axe_norm"))
+)
+
+print(f"🧮 Carreaux scorés accessibilité : {df_access.count()}")
+df_access.select(
+    "IdINSPIRE", "code_departement", "densite_tc", "proximite_axe", "score_accessibilite"
+).show(10, truncate=False)
+--- CELL 14 ---
+"""
+Section 4.4 — Sauvegarde finale accessibilité.
+- Sauvegarde en parquet partitionné par code_departement.
+- Contrôle rapide des volumes et partitions.
+"""
+output_path_access = "/home/jovyan/work/data/output/accessibilite_clean/"
+
+df_access.write \
+    .mode("overwrite") \
+    .partitionBy("code_departement") \
+    .parquet(output_path_access)
+
+print(f"✅ Accessibilité sauvegardée dans : {output_path_access}")
+print(f"📊 Nombre total de carreaux accessibilité : {df_access.count()}")
+print("📦 Top 20 départements par volume :")
+df_access.groupBy("code_departement").count().orderBy(F.desc("count")).show(20, truncate=False)
+--- CELL 16 ---
+"""
+Initialisation de la session Spark optimisée pour le traitement local.
+- Utilisation de toutes les ressources CPU disponibles (local[*])
+- 4 Go de mémoire allouée au driver
+- Activation d'Apache Arrow pour optimiser les éventuels échanges vers Pandas
+"""
+from pyspark.sql import SparkSession
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType
+import pyspark.sql.functions as F
+
+spark = SparkSession.builder \
+    .appName("PadelSpot_Step3_Concurrence") \
+    .master("local[*]") \
+    .config("spark.driver.memory", "4g") \
+    .config("spark.sql.execution.arrow.pyspark.enabled", "true") \
+    .getOrCreate()
+
+# Réduction du log level pour faciliter la lecture dans le notebook
+spark.sparkContext.setLogLevel("WARN")
+spark
+--- CELL 17 ---
+"""
+Lecture et préparation des données du Recensement des Équipements Sportifs (RES) 
+(Focalisation EXCLUSIVE sur les Pistes de Padel)
+"""
+from pyspark.sql.types import IntegerType
+
+# 1. Traitement des équipements PADEL
+df_res_equip = spark.read.csv(
+    "/home/jovyan/work/data/data-es-equipement.csv",
+    header=True,
+    inferSchema=False,
+    sep=";"
+).filter(F.col("type").rlike("(?i)padel"))
+
+# Calcul du nombre de terrains (pistes) par établissement
+df_res_padel_counts = df_res_equip.groupBy("installation_numero").agg(
+    F.count("*").alias("Nombre_de_courts"),
+    F.first("type").alias("Type")
+)
+
+# 2. Traitement des installations
+df_res_inst_raw = spark.read.csv(
+    "/home/jovyan/work/data/data-es-installation.csv",
+    header=True,
+    inferSchema=False,
+    sep=";"
+)
+
+df_res_inst = df_res_inst_raw \
+    .withColumn("Latitude", F.split("coordonnees", ",")[0].cast(DoubleType())) \
+    .withColumn("Longitude", F.split("coordonnees", ",")[1].cast(DoubleType()))
+
+df_res_inst = df_res_inst \
+    .filter(
+        F.col("dep_code").rlike("^(0[1-9]|[1-8][0-9]|9[0-5]|2A|2B)$") & 
+        F.col("Latitude").isNotNull() & F.col("Longitude").isNotNull() &
+        F.col("Latitude").between(41.0, 51.5) & 
+        F.col("Longitude").between(-5.0, 10.0)
+    )
+
+# 3. Jointure Inner RES avec le décompte de courts
+df_res = df_res_padel_counts.join(
+    df_res_inst, 
+    df_res_padel_counts["installation_numero"] == df_res_inst["numero"], 
+    how="inner"
+)
+
+# Standardisation des colonnes
+df_res_std = df_res.select(
+    df_res_inst["nom"].alias("Nom"),
+    df_res_padel_counts["Type"],
+    df_res_inst["commune"].alias("Commune"),
+    df_res_inst["dep_code"].alias("DepartementCode"),
+    df_res_inst["Latitude"],
+    df_res_inst["Longitude"],
+    df_res_padel_counts["Nombre_de_courts"].cast(IntegerType()),
+    F.lit("RES").alias("Source")
+)
+--- CELL 18 ---
+"""
+Lecture et préparation des données de la base SIRENE.
+- Fichier Parquet (lecture optimisée, schéma intégré).
+- Filtrage : activités sportives 93.* et état administratif 'A' (Actif).
+- EXCLUSIVITÉ PADEL : On ne garde que les enseignes avec le mot "padel"
+"""
+df_sirene_raw = spark.read.parquet("/home/jovyan/work/data/StockEtablissement_utf8.parquet")
+
+df_sirene_filtered = df_sirene_raw.filter(
+    F.col("activitePrincipaleEtablissement").startswith("93.") &
+    (F.col("etatAdministratifEtablissement") == "A")
+)
+
+df_sirene_lambert = df_sirene_filtered \
+    .filter(
+        (F.col("coordonneeLambertAbscisseEtablissement") != "[ND]") & 
+        (F.col("coordonneeLambertOrdonneeEtablissement") != "[ND]") &
+        F.col("coordonneeLambertAbscisseEtablissement").isNotNull() & 
+        F.col("coordonneeLambertOrdonneeEtablissement").isNotNull()
+    ) \
+    .withColumn("lambert_x", F.col("coordonneeLambertAbscisseEtablissement").cast(DoubleType())) \
+    .withColumn("lambert_y", F.col("coordonneeLambertOrdonneeEtablissement").cast(DoubleType()))
+
+import pandas as pd
+from pyspark.sql.types import DoubleType, StructType, StructField, IntegerType
+from pyproj import Transformer
+
+transformer = Transformer.from_crs("EPSG:2154", "EPSG:4326", always_xy=True)
+
+@F.pandas_udf("struct<Longitude:double,Latitude:double>")
+def convert_lambert_to_wgs84(x: pd.Series, y: pd.Series) -> pd.DataFrame:
+    lon, lat = transformer.transform(x.values, y.values)
+    return pd.DataFrame({"Longitude": lon, "Latitude": lat})
+
+df_sirene_converted = df_sirene_lambert.withColumn(
+    "wgs84", 
+    convert_lambert_to_wgs84(F.col("lambert_x"), F.col("lambert_y"))
+).withColumn("Longitude", F.col("wgs84.Longitude")) \
+ .withColumn("Latitude", F.col("wgs84.Latitude"))
+
+df_sirene = df_sirene_converted.filter(
+    F.col("Latitude").between(41.0, 51.5) & 
+    F.col("Longitude").between(-5.0, 10.0)
+)
+
+df_ul = spark.read.parquet(
+    "/home/jovyan/work/data/StockUniteLegale_utf8.parquet"
+).select("siren", "denominationUniteLegale", "sigleUniteLegale")
+
+df_sirene_join = df_sirene.join(df_ul, on="siren", how="left")
+
+nom_principal = F.coalesce(
+    F.when(F.col("enseigne1Etablissement").rlike("(?i)padel"), F.col("enseigne1Etablissement")),
+    F.when(F.col("denominationUsuelleEtablissement").rlike("(?i)padel"), F.col("denominationUsuelleEtablissement")),
+    F.when(F.col("denominationUniteLegale").rlike("(?i)padel"), F.col("denominationUniteLegale")),
+    F.col("denominationUniteLegale"),
+    F.col("sigleUniteLegale"),
+    F.col("enseigne1Etablissement"),
+    F.col("denominationUsuelleEtablissement"),
+    F.concat(F.lit("Club de Sport de "), F.col("libelleCommuneEtablissement"))
+)
+
+df_sirene_std = df_sirene_join.select(
+    nom_principal.alias("Nom"),
+    F.lit("Club de Padel").alias("Type"),
+    F.col("libelleCommuneEtablissement").alias("Commune"),
+    F.substring("codeCommuneEtablissement", 1, 2).alias("DepartementCode"),
+    F.col("Latitude"),
+    F.col("Longitude"),
+    F.lit(None).cast(IntegerType()).alias("Nombre_de_courts"), # SIRENE ne fournit pas le nombre de courts
+    F.lit("SIRENE").alias("Source")
+)
+
+# NETTOYAGE SEMANTIQUE STRICT
+# On accepte la ligne si le mot "padel" est présent dans l'un des noms disponibles.
+df_sirene_std = df_sirene_std.filter(
+    F.col("Nom").rlike("(?i)padel")
+)
+--- CELL 19 ---
+"""
+ÉTAPE PRÉALABLE : TÉLÉCHARGEMENT DES UNITES LÉGALES (POUR AVOIR LES VRAIS NOMS SIRENE)
+La base `StockEtablissement` ne contient que l'adresse. 
+Les VRAIS noms des associations et entreprises se trouvent dans `StockUniteLegale_utf8.parquet`.
+"""
+import os
+
+# Le bon lien officiel direct vers le format Parquet
+parquet_url = "https://object.files.data.gouv.fr/data-pipeline-open/siren/stock/StockUniteLegale_utf8.parquet"
+parquet_path = "/home/jovyan/work/data/StockUniteLegale_utf8.parquet"
+
+if not os.path.exists(parquet_path):
+    print("⏳ Téléchargement du fichier Parquet des Unités Légales (Plus rapide et optimisé)...")
+    !wget -q --show-progress -O {parquet_path} {parquet_url}
+    print("✅ Le fichier Parquet des Unités Légales est prêt !")
+else:
+    print("✅ Le fichier des Unités Légales est déjà présent dans /data !")
+--- CELL 20 ---
+"""
+Union des données RES et SIRENE.
+Déduplication basée sur l'arrondissement des coordonnées GPS (3 décimales)
+correspondant à une distance d'environ 100m.
+Sauvegarde finale au format Parquet.
+"""
+# 1. Union RES + SIRENE
+df_combined = df_res_std.unionByName(df_sirene_std, allowMissingColumns=True)
+
+# 2. Arrondi GPS pour identifier les doublons spatiaux
+df_dedup = df_combined \
+    .withColumn("Lat_approx", F.round("Latitude", 3)) \
+    .withColumn("Lon_approx", F.round("Longitude", 3))
+
+# Pour la déduplication, on veut ABSOLUMENT garder la ligne RES si elle existe, 
+# car c'est la seule qui possède le "Nombre_de_courts" réel !
+# On trie d'abord par la source (RES avant SIRENE) avant de la droper.
+from pyspark.sql.window import Window
+windowSpec = Window.partitionBy("Lat_approx", "Lon_approx").orderBy(F.col("Nombre_de_courts").desc_nulls_last())
+
+df_dedup = df_dedup.withColumn("row_num", F.row_number().over(windowSpec)) \
+    .filter(F.col("row_num") == 1) \
+    .drop("Lat_approx", "Lon_approx", "row_num")
+
+# Optionnel: Re-filtrer les Départements propres pour le résultat final
+df_dedup = df_dedup.filter(F.col("DepartementCode").rlike("^(0[1-9]|[1-8][0-9]|9[0-5]|2A|2B)$"))
+
+# 3. Sauvegarde partitionnée
+output_path = "/home/jovyan/work/data/output/concurrence_padel/"
+df_dedup.write \
+    .mode("overwrite") \
+    .partitionBy("DepartementCode") \
+    .parquet(output_path)
+
+print(f"✅ Sauvegarde partitionnée réussie dans '{output_path}'")
+print(f"📊 Nombre total d'implantations exclusives Padel dédupliquées: {df_dedup.count()}")
+--- CELL 21 ---
+"""
+Lecture et visualisation des données finales sauvegardées.
+On recharge le Parquet partitionné et on affiche un échantillon avec toPandas() 
+qui rend un tableau formaté élégant dans Jupyter.
+"""
+# Recharger le jeu de données depuis la sauvegarde Parquet
+df_final = spark.read.parquet("/home/jovyan/work/data/output/concurrence_padel/")
+
+print("Répartition par source (Uniquement Padel) :")
+df_final.groupBy("Source").count().show()
+
+print("Moyenne du nombre de courts par centre :")
+df_final.groupBy("Source").agg(F.round(F.mean("Nombre_de_courts"), 1).alias("Moyenne_Courts")).show()
+
+# Filtre pour le département 76 (Seine-Maritime)
+df_76 = df_final.filter(F.col("DepartementCode") == "14")
+print(f"🎾 Nombre de complexes Padel dans le 76 : {df_76.count()}")
+
+# Afficher les lignes pour le département 76 sous une belle forme Pandas
+df_76.sort(F.desc("Nombre_de_courts")).limit(50).toPandas()
+--- CELL 23 ---
+"""
+Section 5.1 — Lecture Google Trends avec schéma explicite et nettoyage.
+- Lecture CSV UTF-8 avec séparateur virgule.
+- Normalisation des noms de régions (accents, casse, tirets, ponctuation).
+- Cast de l'indice en IntegerType.
+- Imputation des valeurs nulles par la médiane nationale.
+"""
+import os
+import re
+import unicodedata
+from pyspark.sql import SparkSession
+import pyspark.sql.functions as F
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType
+
+# Spark fallback si kernel redémarré
+if "spark" not in globals() or spark is None:
+    spark = SparkSession.builder \
+        .appName("PadelSpot_Step5_Trends") \
+        .master("local[*]") \
+        .config("spark.driver.memory", "4g") \
+        .config("spark.sql.execution.arrow.pyspark.enabled", "true") \
+        .getOrCreate()
+    spark.sparkContext.setLogLevel("WARN")
+
+# Chemins possibles selon l'arborescence locale
+trends_candidates = [
+    "/home/jovyan/work/data/trends/geoMap.csv",
+    "/home/jovyan/work/data/geoMap.csv",
+]
+trends_path = next((p for p in trends_candidates if os.path.exists(p)), None)
+if trends_path is None:
+    raise FileNotFoundError(
+        "geoMap.csv introuvable. Chemins testés: /home/jovyan/work/data/trends/geoMap.csv et /home/jovyan/work/data/geoMap.csv"
+    )
+
+# Schéma explicite : 2 colonnes attendues (région, indice)
+trends_schema = StructType([
+    StructField("region_raw", StringType(), True),
+    StructField("indice_raw", StringType(), True),
+])
+
+df_trends_raw = spark.read \
+    .option("header", True) \
+    .option("sep", ",") \
+    .option("encoding", "UTF-8") \
+    .schema(trends_schema) \
+    .csv(trends_path)
+
+def normalize_region_name(value: str) -> str:
+    """Normalise les noms de régions pour matcher robustement (accents/casse/tirets)."""
+    if value is None:
+        return None
+    text = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
+    text = text.lower()
+    text = text.replace("-", " ").replace("_", " ")
+    text = re.sub(r"[^a-z0-9 ]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+normalize_region_udf = F.udf(normalize_region_name, StringType())
+
+df_trends_clean = df_trends_raw \
+    .withColumn("region_norm_raw", normalize_region_udf(F.col("region_raw"))) \
+    .withColumn(
+        "indice_trends",
+        F.regexp_extract(F.coalesce(F.col("indice_raw"), F.lit("")), r"(\d+)", 1).cast(IntegerType())
+    )
+
+# Harmonisation libellés source -> libellés canonisés du mapping
+region_aliases = {
+    "centre val de loire": "centre",
+}
+alias_expr = F.create_map([x for kv in region_aliases.items() for x in (F.lit(kv[0]), F.lit(kv[1]))])
+
+df_trends_clean = df_trends_clean \
+    .withColumn(
+        "region_norm",
+        F.coalesce(alias_expr.getItem(F.col("region_norm_raw")), F.col("region_norm_raw"))
+    ) \
+    .filter(F.col("region_norm") != F.lit("region"))
+
+median_row = df_trends_clean.agg(
+    F.expr("percentile_approx(indice_trends, 0.5, 1000)").alias("median_indice")
+).collect()[0]
+median_indice = int(median_row["median_indice"]) if median_row["median_indice"] is not None else 50
+
+df_trends_clean = df_trends_clean.withColumn(
+    "indice_trends",
+    F.coalesce(F.col("indice_trends"), F.lit(median_indice))
+)
+
+print(f"📂 Fichier Trends utilisé : {trends_path}")
+print(f"📈 Médiane nationale (imputation nulls) : {median_indice}")
+print(f"📊 Lignes Trends lues : {df_trends_clean.count()}")
+df_trends_clean.select("region_raw", "region_norm", "indice_trends").show(30, truncate=False)
+--- CELL 24 ---
+"""
+Section 5.2 — Mapping hardcodé régions (22) -> départements métropolitains (96).
+- Création d'un dictionnaire Python complet (ancienne maille régionale à 22 régions).
+- Explosion en table départementale: une ligne par code_departement.
+- Contrôle d'exhaustivité : couverture des 96 départements métropolitains.
+"""
+from pyspark.sql.types import ArrayType
+
+region_to_departements = {
+    "alsace": ["67", "68"],
+    "aquitaine": ["24", "33", "40", "47", "64"],
+    "auvergne": ["03", "15", "43", "63"],
+    "basse normandie": ["14", "50", "61"],
+    "bourgogne": ["21", "58", "71", "89"],
+    "bretagne": ["22", "29", "35", "56"],
+    "centre": ["18", "28", "36", "37", "41", "45"],
+    "champagne ardenne": ["08", "10", "51", "52"],
+    "corse": ["2A", "2B"],
+    "franche comte": ["25", "39", "70", "90"],
+    "haute normandie": ["27", "76"],
+    "ile de france": ["75", "77", "78", "91", "92", "93", "94", "95"],
+    "languedoc roussillon": ["11", "30", "34", "48", "66"],
+    "limousin": ["19", "23", "87"],
+    "lorraine": ["54", "55", "57", "88"],
+    "midi pyrenees": ["09", "12", "31", "32", "46", "65", "81", "82"],
+    "nord pas de calais": ["59", "62"],
+    "pays de la loire": ["44", "49", "53", "72", "85"],
+    "picardie": ["02", "60", "80"],
+    "poitou charentes": ["16", "17", "79", "86"],
+    "provence alpes cote d azur": ["04", "05", "06", "13", "83", "84"],
+    "rhone alpes": ["01", "07", "26", "38", "42", "69", "73", "74"],
+}
+
+# DataFrame mapping région -> liste de départements
+mapping_rows = [(region, deps) for region, deps in region_to_departements.items()]
+mapping_schema = StructType([
+    StructField("region_norm", StringType(), False),
+    StructField("departements", ArrayType(StringType()), False),
+])
+
+df_region_deps = spark.createDataFrame(mapping_rows, schema=mapping_schema)
+
+# Explosion : une ligne par département
+df_region_deps_exploded = df_region_deps.select(
+    "region_norm",
+    F.explode("departements").alias("code_departement")
+)
+
+# Contrôle exhaustivité : 96 départements métropolitains
+# (01..95 sauf 20, + 2A et 2B).
+expected_deps = [f"{i:02d}" for i in range(1, 96) if i != 20] + ["2A", "2B"]
+expected_deps_set = set(expected_deps)
+mapped_deps = {r["code_departement"] for r in df_region_deps_exploded.select("code_departement").distinct().collect()}
+missing_deps = sorted(expected_deps_set - mapped_deps)
+extra_deps = sorted(mapped_deps - expected_deps_set)
+
+if missing_deps or extra_deps:
+    raise ValueError(
+        f"Mapping incomplet/invalide. manquants={missing_deps}, extras={extra_deps}"
+    )
+
+# Jointure région trends -> mapping département
+df_trends_by_departement = df_trends_clean.select("region_norm", "indice_trends").join(
+    df_region_deps_exploded,
+    on="region_norm",
+    how="inner"
+)
+
+# Filet de sécurité si libellés région source diffèrent légèrement
+unmatched_count = df_region_deps_exploded.join(
+    df_trends_clean.select("region_norm").distinct(),
+    on="region_norm",
+    how="left_anti"
+).count()
+if unmatched_count > 0:
+    print(f"⚠️ {unmatched_count} régions du mapping n'ont pas trouvé de valeur Trends source.")
+
+print(f"🧭 Régions mappées : {len(region_to_departements)}")
+print(f"🧩 Départements couverts : {len(mapped_deps)}")
+print(f"📊 Lignes Trends après explosion départementale : {df_trends_by_departement.count()}")
+df_trends_by_departement.orderBy("code_departement").show(120, truncate=False)
+--- CELL 25 ---
+"""
+Section 5.3 — Broadcast Join Trends -> carreaux INSEE + sauvegarde.
+- Chargement des carreaux Filosofi nettoyés.
+- Jointure explicite avec F.broadcast() sur code_departement.
+- Ajout de indice_demande_trends à chaque carreau.
+- Sauvegarde parquet partitionnée par code_departement.
+"""
+# Chargement carreaux INSEE (résultat étape 2)
+df_filosofi_for_trends = spark.read.parquet("/home/jovyan/work/data/output/filosofi_clean/")
+
+# Le dataset trends départemental est minuscule (~96 lignes, << 1 Mo).
+# Broadcast Join est optimal ici : Spark envoie cette petite table à chaque exécuteur,
+# évite un Shuffle Join coûteux sur le gros DataFrame des carreaux (1.8M+ lignes).
+df_trends_dept_small = df_trends_by_departement.select("code_departement", "indice_trends")
+
+df_filosofi_trends = df_filosofi_for_trends.join(
+    F.broadcast(df_trends_dept_small),
+    on="code_departement",
+    how="left"
+)
+
+# Renommage final demandé
+df_filosofi_trends = df_filosofi_trends.withColumnRenamed("indice_trends", "indice_demande_trends")
+
+# Sécurité : si jamais une valeur manque après jointure, on remplit avec la médiane nationale
+df_filosofi_trends = df_filosofi_trends.withColumn(
+    "indice_demande_trends",
+    F.coalesce(F.col("indice_demande_trends"), F.lit(int(median_indice)))
+)
+
+output_path_trends_joined = "/home/jovyan/work/data/output/trends_joined/"
+df_filosofi_trends.write \
+    .mode("overwrite") \
+    .partitionBy("code_departement") \
+    .parquet(output_path_trends_joined)
+
+print(f"✅ Trends joint sauvegardé dans : {output_path_trends_joined}")
+print(f"📊 Nombre de carreaux enrichis : {df_filosofi_trends.count()}")
+print("📦 Vérification rapide (top 20 départements) :")
+df_filosofi_trends.groupBy("code_departement").agg(
+    F.count("*").alias("nb_carreaux"),
+    F.first("indice_demande_trends").alias("indice_demande_trends")
+).orderBy(F.desc("nb_carreaux")).show(20, truncate=False)
+
+df_filosofi_trends.select(
+    "IdINSPIRE", "code_departement", "indice_demande_trends",
+    "part_cible_padel", "score_revenu", "Longitude", "Latitude"
+).show(20, truncate=False)
+--- CELL 27 ---
+"""
+Section 6.1 — Initialisation, lecture des sources et utilitaires.
+- SparkSession optimisée (local[*], 4g, Arrow).
+- Lecture des 4 sources Parquet avec sélection des colonnes utiles.
+- Définition des fonctions de normalisation Min-Max robustes (edge min=max -> 0.5).
+"""
+from pyspark.sql import SparkSession
+import pyspark.sql.functions as F
+from pyspark.sql.types import DoubleType
+from pyspark.sql.window import Window
+from functools import reduce
+import pandas as pd
+
+# Initialisation Spark optimisée (contrainte explicite)
+spark = SparkSession.builder \
+    .appName("PadelSpot_Step6_ScoreFinal") \
+    .master("local[*]") \
+    .config("spark.driver.memory", "4g") \
+    .config("spark.sql.execution.arrow.pyspark.enabled", "true") \
+    .getOrCreate()
+spark.sparkContext.setLogLevel("WARN")
+
+# Poids par défaut (facilement modifiables)
+w1 = 0.30  # concurrence
+w2 = 0.25  # accessibilité
+w3 = 0.20  # immobilier
+w4 = 0.15  # revenu
+w5 = 0.10  # démographie cible
+seuil_rentabilite = 3000.0
+
+# Sources (colonnes utiles uniquement)
+df_access = spark.read.parquet("/home/jovyan/work/data/output/accessibilite_clean/").select(
+    "IdINSPIRE", "code_commune_insee", "Latitude", "Longitude",
+    "part_cible_padel", "score_revenu", "score_accessibilite", "code_departement"
+)
+
+df_concurrence = spark.read.parquet("/home/jovyan/work/data/output/concurrence_padel/").select(
+    F.col("Nom").alias("nom_club"),
+    F.col("Latitude").alias("lat_club"),
+    F.col("Longitude").alias("lon_club"),
+    F.col("DepartementCode").alias("code_departement")
+).filter(F.col("lat_club").isNotNull() & F.col("lon_club").isNotNull())
+
+df_dvf = spark.read.parquet("/home/jovyan/work/data/output/dvf_clean/").select(
+    "code_departement", "code_commune", "prix_median_m2"
+)
+
+df_trends = spark.read.parquet("/home/jovyan/work/data/output/trends_joined/").select(
+    "IdINSPIRE", "indice_demande_trends"
+)
+
+def add_minmax_norm(df, input_col: str, output_col: str):
+    """Normalisation Min-Max robuste. Si min=max, renvoie 0.5."""
+    stats = df.agg(
+        F.min(input_col).alias("min_v"),
+        F.max(input_col).alias("max_v")
+    ).collect()[0]
+    min_v = float(stats["min_v"]) if stats["min_v"] is not None else 0.0
+    max_v = float(stats["max_v"]) if stats["max_v"] is not None else 0.0
+    if max_v > min_v:
+        return df.withColumn(output_col, (F.col(input_col) - F.lit(min_v)) / F.lit(max_v - min_v))
+    return df.withColumn(output_col, F.lit(0.5))
+
+print(f"📦 accessibilite_clean: {df_access.count():,} lignes")
+print(f"🎾 concurrence_padel: {df_concurrence.count():,} lignes")
+print(f"🏠 dvf_clean: {df_dvf.count():,} lignes")
+print(f"📈 trends_joined: {df_trends.count():,} lignes")
+--- CELL 28 ---
+"""
+Section 6.2 — Score concurrentiel (broadcast + Pandas UDF Haversine vectorisée).
+- Broadcast explicite de concurrence_padel (~faible volumétrie relative).
+- Jointure par buckets spatiaux + candidats voisins pour éviter un produit cartésien global.
+- Calcul vectorisé des distances et agrégation: distance_club_plus_proche, nb_clubs_5km.
+- score_concurrence: 1 - norm(nb_clubs_5km) + bonus si distance > 10 km.
+"""
+@F.pandas_udf(DoubleType())
+def haversine_km(lat1: pd.Series, lon1: pd.Series, lat2: pd.Series, lon2: pd.Series) -> pd.Series:
+    import numpy as np
+    r = 6371.0
+    lat1_rad = np.radians(lat1.values)
+    lon1_rad = np.radians(lon1.values)
+    lat2_rad = np.radians(lat2.values)
+    lon2_rad = np.radians(lon2.values)
+    dlat = lat2_rad - lat1_rad
+    dlon = lon2_rad - lon1_rad
+    a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1_rad) * np.cos(lat2_rad) * np.sin(dlon / 2.0) ** 2
+    c = 2.0 * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a))
+    return pd.Series(r * c)
+
+# Broadcast obligatoire : dataset de concurrence nettement plus petit que la base carreaux.
+# Broadcast Join évite un Shuffle Join global coûteux sur 1.8M+ carreaux.
+bucket_deg = 0.05  # ~5.5 km en latitude
+neighbor_span = 3  # fenêtre ±3 buckets pour couvrir ~16 km et estimer le plus proche localement
+
+df_clubs_b = df_concurrence \
+    .withColumn("lat_b", F.floor(F.col("lat_club") / F.lit(bucket_deg)).cast("int")) \
+    .withColumn("lon_b", F.floor(F.col("lon_club") / F.lit(bucket_deg)).cast("int"))
+
+df_cells_b = df_access \
+    .withColumn("lat_b", F.floor(F.col("Latitude") / F.lit(bucket_deg)).cast("int")) \
+    .withColumn("lon_b", F.floor(F.col("Longitude") / F.lit(bucket_deg)).cast("int"))
+
+neighbors = F.array(*[
+    F.struct(
+        (F.col("lat_b") + F.lit(dlat)).alias("lat_b_n"),
+        (F.col("lon_b") + F.lit(dlon)).alias("lon_b_n")
+    )
+    for dlat in range(-neighbor_span, neighbor_span + 1)
+    for dlon in range(-neighbor_span, neighbor_span + 1)
+])
+
+df_candidates = df_cells_b \
+    .withColumn("nb", F.explode(neighbors)) \
+    .select(
+        "IdINSPIRE", "Latitude", "Longitude", "code_commune_insee", "score_accessibilite",
+        "score_revenu", "part_cible_padel", "code_departement",
+        F.col("nb.lat_b_n").alias("lat_b_n"),
+        F.col("nb.lon_b_n").alias("lon_b_n")
+    )
+
+df_pairs = df_candidates.join(
+    F.broadcast(df_clubs_b),
+    (df_candidates["lat_b_n"] == df_clubs_b["lat_b"]) &
+    (df_candidates["lon_b_n"] == df_clubs_b["lon_b"]),
+    how="left"
+)
+
+df_pairs = df_pairs.withColumn(
+    "distance_km",
+    haversine_km(F.col("Latitude"), F.col("Longitude"), F.col("lat_club"), F.col("lon_club"))
+)
+
+df_conc_metrics = df_pairs.groupBy("IdINSPIRE").agg(
+    F.min("distance_km").alias("distance_club_plus_proche"),
+    F.sum(F.when(F.col("distance_km") <= 5.0, F.lit(1)).otherwise(F.lit(0))).cast("int").alias("nb_clubs_5km")
+)
+
+df_step6 = df_access.join(df_conc_metrics, on="IdINSPIRE", how="left") \
+    .withColumn("distance_club_plus_proche", F.coalesce(F.col("distance_club_plus_proche"), F.lit(50.0))) \
+    .withColumn("nb_clubs_5km", F.coalesce(F.col("nb_clubs_5km"), F.lit(0)))
+
+df_step6 = add_minmax_norm(df_step6, "nb_clubs_5km", "nb_clubs_5km_norm")
+df_step6 = df_step6.withColumn("score_concurrence_base", F.lit(1.0) - F.col("nb_clubs_5km_norm"))
+
+# Bonus si le club le plus proche est à plus de 10 km
+df_step6 = df_step6.withColumn(
+    "score_concurrence",
+    F.least(
+        F.lit(1.0),
+        F.col("score_concurrence_base") + F.when(F.col("distance_club_plus_proche") > 10.0, F.lit(0.10)).otherwise(F.lit(0.0))
+    )
+).drop("score_concurrence_base", "nb_clubs_5km_norm")
+
+print(f"✅ Score concurrentiel calculé : {df_step6.count():,} carreaux")
+df_step6.select("IdINSPIRE", "distance_club_plus_proche", "nb_clubs_5km", "score_concurrence").show(10, truncate=False)
+--- CELL 29 ---
+"""
+Section 6.3 — Score immobilier, demande Trends, score composite et stabilité.
+- Jointure DVF en left join avec fallback médiane nationale.
+- Exclusion des carreaux non rentables (prix_median_m2 > 3000 €/m²).
+- Jointure left Trends + normalisation robuste.
+- Calcul score_final + analyse de sensibilité (5 combinaisons de poids).
+"""
+# Repartir d'une base propre de colonnes Step6 (évite les duplications en cas de rerun)
+df_step6 = df_step6.select(
+    "IdINSPIRE", "code_commune_insee", "Latitude", "Longitude",
+    "part_cible_padel", "score_revenu", "score_accessibilite", "code_departement",
+    "distance_club_plus_proche", "nb_clubs_5km", "score_concurrence"
+)
+
+# -------------------------
+# Score Immobilier
+# -------------------------
+# Extraction d'un code commune compatible DVF (3 derniers chars du premier code INSEE trouvé).
+# Exemples: 24534 -> 534, 2A041 -> 041
+df_step6 = df_step6.withColumn(
+    "code_commune_join",
+    F.regexp_extract(F.upper(F.col("code_commune_insee")), r"([0-9A-B]{5})", 1)
+).withColumn(
+    "code_commune_3",
+    F.when(F.length(F.col("code_commune_join")) == 5, F.substring(F.col("code_commune_join"), 3, 3)).otherwise(F.lit(None))
+)
+
+dvf_median_row = df_dvf.agg(F.expr("percentile_approx(prix_median_m2, 0.5, 1000)").alias("median_dvf")).collect()[0]
+median_prix_m2 = float(dvf_median_row["median_dvf"]) if dvf_median_row["median_dvf"] is not None else 1500.0
+
+df_dvf_join = df_dvf.select(
+    F.col("code_departement").alias("dvf_code_departement"),
+    F.col("code_commune").alias("dvf_code_commune"),
+    F.col("prix_median_m2").alias("dvf_prix_median_m2")
+)
+
+df_step6 = df_step6.join(
+    df_dvf_join,
+    (df_step6["code_departement"] == df_dvf_join["dvf_code_departement"]) &
+    (df_step6["code_commune_3"] == df_dvf_join["dvf_code_commune"]),
+    how="left"
+)
+
+df_step6 = df_step6.withColumn("prix_median_m2", F.coalesce(F.col("dvf_prix_median_m2"), F.lit(median_prix_m2))) \
+    .drop("dvf_code_departement", "dvf_code_commune", "dvf_prix_median_m2")
+
+df_step6 = add_minmax_norm(df_step6, "prix_median_m2", "prix_m2_norm")
+df_step6 = df_step6.withColumn("score_immobilier", F.lit(1.0) - F.col("prix_m2_norm"))
+
+# Exclusion non rentable
+df_step6 = df_step6.filter(F.col("prix_median_m2") <= F.lit(seuil_rentabilite))
+
+# -------------------------
+# Trends
+# -------------------------
+trend_median_row = df_trends.agg(F.expr("percentile_approx(indice_demande_trends, 0.5, 1000)").alias("median_trends")).collect()[0]
+median_trends = int(trend_median_row["median_trends"]) if trend_median_row["median_trends"] is not None else 50
+
+df_trends_join = df_trends.select(
+    F.col("IdINSPIRE").alias("trend_IdINSPIRE"),
+    F.col("indice_demande_trends").alias("trend_indice_demande_trends")
+)
+
+df_step6 = df_step6.join(
+    df_trends_join,
+    df_step6["IdINSPIRE"] == df_trends_join["trend_IdINSPIRE"],
+    how="left"
+).drop("trend_IdINSPIRE")
+
+df_step6 = df_step6.withColumn(
+    "indice_demande_trends",
+    F.coalesce(F.col("trend_indice_demande_trends"), F.lit(median_trends))
+).drop("trend_indice_demande_trends")
+
+df_step6 = add_minmax_norm(df_step6, "indice_demande_trends", "indice_demande_trends_norm")
+
+# -------------------------
+# Score final (pondérations par défaut)
+# -------------------------
+score_core = (
+    F.lit(w1) * F.col("score_concurrence") +
+    F.lit(w2) * F.col("score_accessibilite") +
+    F.lit(w3) * F.col("score_immobilier") +
+    F.lit(w4) * F.col("score_revenu") +
+    F.lit(w5) * F.col("part_cible_padel")
+)
+
+df_step6 = df_step6.withColumn("score_final", score_core * F.col("indice_demande_trends_norm"))
+
+# -------------------------
+# Analyse de sensibilité (5 combinaisons)
+# -------------------------
+weight_sets = [
+    ("base", 0.30, 0.25, 0.20, 0.15, 0.10),
+    ("conc_plus", 0.40, 0.20, 0.15, 0.15, 0.10),
+    ("access_plus", 0.20, 0.35, 0.20, 0.15, 0.10),
+    ("immo_plus", 0.25, 0.20, 0.30, 0.15, 0.10),
+    ("demo_plus", 0.25, 0.20, 0.15, 0.15, 0.25),
+]
+
+tops = []
+for combo_name, a, b, c, d, e in weight_sets:
+    variant_score = (
+        F.lit(a) * F.col("score_concurrence") +
+        F.lit(b) * F.col("score_accessibilite") +
+        F.lit(c) * F.col("score_immobilier") +
+        F.lit(d) * F.col("score_revenu") +
+        F.lit(e) * F.col("part_cible_padel")
+    ) * F.col("indice_demande_trends_norm")
+
+    df_variant = df_step6.select("IdINSPIRE", variant_score.alias("score_variant"))
+    w_top = Window.orderBy(F.desc("score_variant"))
+    df_top500 = df_variant.withColumn("rn", F.row_number().over(w_top)) \
+        .filter(F.col("rn") <= 500) \
+        .select("IdINSPIRE") \
+        .withColumn("combo", F.lit(combo_name))
+    tops.append(df_top500)
+
+df_tops_union = reduce(lambda x, y: x.unionByName(y), tops)
+df_stabilite = df_tops_union.groupBy("IdINSPIRE").agg(F.countDistinct("combo").alias("stabilite_score"))
+
+df_step6 = df_step6.join(df_stabilite, on="IdINSPIRE", how="left") \
+    .withColumn("stabilite_score", F.coalesce(F.col("stabilite_score"), F.lit(0)))
+
+print(f"✅ Base Step6 prête : {df_step6.count():,} carreaux après filtre rentabilité")
+df_step6.select("IdINSPIRE", "score_concurrence", "score_accessibilite", "score_immobilier", "score_final", "stabilite_score").show(10, truncate=False)
+--- CELL 30 ---
+"""
+Section 6.4 — Top zones, export Parquet et GeoJSON (Folium compatible).
+- Top 1000 carreaux par score_final.
+- Agrégation communale (score moyen, nb carreaux, centroïde).
+- Filtre communes avec >= 3 carreaux (robustesse).
+- Export parquet partitionné + GeoJSON FeatureCollection WGS84.
+"""
+import json
+import os
+
+# Top 1000 carreaux
+w_rank = Window.orderBy(F.desc("score_final"))
+df_top1000 = df_step6.withColumn("rank_final", F.row_number().over(w_rank)) \
+    .filter(F.col("rank_final") <= 1000)
+
+# Agrégation par commune
+df_top_communes = df_top1000.groupBy("code_commune_insee", "code_departement").agg(
+    F.count("*").alias("nb_carreaux_top1000"),
+    F.avg("score_final").alias("score_final_moyen"),
+    F.avg("score_concurrence").alias("score_concurrence_moyen"),
+    F.avg("score_accessibilite").alias("score_accessibilite_moyen"),
+    F.avg("score_immobilier").alias("score_immobilier_moyen"),
+    F.avg("score_revenu").alias("score_revenu_moyen"),
+    F.avg("part_cible_padel").alias("part_cible_padel_moyen"),
+    F.avg(F.col("indice_demande_trends").cast("double")).alias("indice_demande_trends_moyen"),
+    F.avg(F.col("stabilite_score").cast("double")).alias("stabilite_score_moyen"),
+    F.avg("Latitude").alias("latitude_centroid"),
+    F.avg("Longitude").alias("longitude_centroid")
+).filter(F.col("nb_carreaux_top1000") >= 3)
+
+# Export Parquet final (carreaux)
+output_score_final = "/home/jovyan/work/data/output/score_final/"
+df_top1000.write \
+    .mode("overwrite") \
+    .partitionBy("code_departement") \
+    .parquet(output_score_final)
+
+# Export GeoJSON (communes) compatible Folium
+geojson_path = "/home/jovyan/work/data/output/top_zones.geojson"
+os.makedirs(os.path.dirname(geojson_path), exist_ok=True)
+
+rows = df_top_communes.collect()
+features = []
+for r in rows:
+    lon = float(r["longitude_centroid"]) if r["longitude_centroid"] is not None else None
+    lat = float(r["latitude_centroid"]) if r["latitude_centroid"] is not None else None
+    if lon is None or lat is None:
+        continue
+
+    properties = {
+        "code_commune_insee": r["code_commune_insee"],
+        "code_departement": r["code_departement"],
+        "nb_carreaux_top1000": int(r["nb_carreaux_top1000"]),
+        "score_final_moyen": float(r["score_final_moyen"]),
+        "score_concurrence_moyen": float(r["score_concurrence_moyen"]),
+        "score_accessibilite_moyen": float(r["score_accessibilite_moyen"]),
+        "score_immobilier_moyen": float(r["score_immobilier_moyen"]),
+        "score_revenu_moyen": float(r["score_revenu_moyen"]),
+        "part_cible_padel_moyen": float(r["part_cible_padel_moyen"]),
+        "indice_demande_trends_moyen": float(r["indice_demande_trends_moyen"]),
+        "stabilite_score_moyen": float(r["stabilite_score_moyen"]),
+    }
+
+    feature = {
+        "type": "Feature",
+        "geometry": {
+            "type": "Point",
+            "coordinates": [lon, lat],
+        },
+        "properties": properties,
+    }
+    features.append(feature)
+
+geojson = {
+    "type": "FeatureCollection",
+    "features": features,
+}
+
+with open(geojson_path, "w", encoding="utf-8") as f:
+    json.dump(geojson, f, ensure_ascii=False)
+
+print(f"✅ Parquet score final sauvegardé : {output_score_final}")
+print(f"✅ GeoJSON top zones sauvegardé : {geojson_path}")
+print(f"📊 Top1000 carreaux: {df_top1000.count():,}")
+print(f"🗺️ Communes retenues (>=3 carreaux top1000): {len(features):,}")
+df_top_communes.orderBy(F.desc("score_final_moyen")).show(20, truncate=False)
+--- CELL 31 ---
+"""
+Section 6.5 — Export complet France (tous les carreaux scorés).
+- Conserve l'ensemble de df_step6 pour cartographie nationale.
+- Export parquet partitionné par code_departement.
+"""
+output_score_final_full = "/home/jovyan/work/data/output/score_final_full/"
+
+df_step6.write \
+    .mode("overwrite") \
+    .partitionBy("code_departement") \
+    .parquet(output_score_final_full)
+
+print(f"✅ Export complet score final : {output_score_final_full}")
+print(f"📊 Nombre total de carreaux scorés (France) : {df_step6.count():,}")
+print("📦 Nombre de départements présents :")
+df_step6.select("code_departement").distinct().count()
+--- CELL 32 ---
+"""
+ETAPE 7 - CELLULE 1/3
+Preparation de la table principale dash_carreaux_full (grain carreau INSEE) via jointures Spark.
+- Lecture des sources avec schemas explicites pour les CSV.
+- Jointures lourdes uniquement dans Spark.
+- Optimisation des types (float32/int16) pour reduire le volume disque.
+- Export Parquet partitionne par code_departement + verification de comptage.
+"""
+
+import os
+from pyspark.sql import SparkSession, Window
+import pyspark.sql.functions as F
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType, LongType, FloatType, ShortType, IntegerType
+
+PATHS = {
+    "accessibilite_clean": "/home/jovyan/work/data/output/accessibilite_clean/",
+    "filosofi_clean": "/home/jovyan/work/data/output/filosofi_clean/",
+    "dvf_clean": "/home/jovyan/work/data/output/dvf_clean/",
+    "concurrence_padel": "/home/jovyan/work/data/output/clubs_concurrents/concurrence_padel/",
+    "clubs_concurrents": "/home/jovyan/work/data/output/clubs_concurrents/",
+    "trends_joined": "/home/jovyan/work/data/output/trends_joined/",
+    "score_final": "/home/jovyan/work/data/output/score_final/",
+    "score_final_full": "/home/jovyan/work/data/output/score_final_full/",
+    "osm_transport": "/home/jovyan/work/data/output/osm_transport_stops.csv",
+    "osm_roads": "/home/jovyan/work/data/output/osm_road_axes.csv",
+    "top_zones_geojson": "/home/jovyan/work/data/output/top_zones.geojson",
+}
+OUTPUT_DASH = "/home/jovyan/work/data/dash_ready/"
+os.makedirs(OUTPUT_DASH, exist_ok=True)
+
+# Spark session dediee ETAPE 7
+spark = SparkSession.builder \
+    .appName("PadelSpot_Step7_DashReady") \
+    .master("local[*]") \
+    .config("spark.driver.memory", "6g") \
+    .config("spark.sql.execution.arrow.pyspark.enabled", "true") \
+    .getOrCreate()
+spark.sparkContext.setLogLevel("WARN")
+
+# Helpers
+
+def _first_existing_path(candidates):
+    return next((p for p in candidates if os.path.exists(p)), None)
+
+
+def _bytes_to_mb(value):
+    return round(float(value) / (1024.0 * 1024.0), 2)
+
+
+# Lecture des sources principales
+df_score_full = spark.read.parquet(PATHS["score_final_full"]).select(
+    "IdINSPIRE", "code_commune_insee", "code_departement",
+    "Latitude", "Longitude",
+    "score_final", "score_concurrence", "score_accessibilite",
+    "score_immobilier", "score_revenu", "stabilite_score",
+    "part_cible_padel", "indice_demande_trends",
+    "distance_club_plus_proche", "nb_clubs_5km",
+    "prix_median_m2"
+)
+
+df_trends = spark.read.parquet(PATHS["trends_joined"]).select(
+    F.col("IdINSPIRE").alias("tr_IdINSPIRE"),
+    F.col("indice_demande_trends").alias("tr_indice_demande_trends")
+)
+
+df_access = spark.read.parquet(PATHS["accessibilite_clean"]).select(
+    F.col("IdINSPIRE").alias("ac_IdINSPIRE"),
+    "densite_tc", "proximite_axe"
+)
+
+df_filo = spark.read.parquet(PATHS["filosofi_clean"]).select(
+    F.col("IdINSPIRE").alias("fi_IdINSPIRE"),
+    "Men_pauv", "Ind_18_24", "Ind_25_39", "I_pauv", "Ind", "Ind_snv"
+)
+
+df_dvf = spark.read.parquet(PATHS["dvf_clean"]).select(
+    "code_departement", "code_commune", "prix_median_m2", "nb_transactions"
+)
+
+# Jointures heavy data -> Spark uniquement
+# 1) score_full + trends
+df_dash = df_score_full.join(
+    df_trends,
+    df_score_full["IdINSPIRE"] == df_trends["tr_IdINSPIRE"],
+    how="left"
+).drop("tr_IdINSPIRE")
+
+# 2) + accessibilite
+df_dash = df_dash.join(
+    df_access,
+    df_dash["IdINSPIRE"] == df_access["ac_IdINSPIRE"],
+    how="left"
+).drop("ac_IdINSPIRE")
+
+# 3) + filosofi
+df_dash = df_dash.join(
+    df_filo,
+    df_dash["IdINSPIRE"] == df_filo["fi_IdINSPIRE"],
+    how="left"
+).drop("fi_IdINSPIRE")
+
+# 4) + DVF (broadcast). Join robuste sur code_departement + code_commune extrait.
+df_dash = df_dash.withColumn(
+    "code_commune_3",
+    F.when(
+        F.length(F.regexp_extract(F.upper(F.col("code_commune_insee")), r"([0-9A-B]{5})", 1)) == 5,
+        F.substring(F.regexp_extract(F.upper(F.col("code_commune_insee")), r"([0-9A-B]{5})", 1), 3, 3)
+    ).otherwise(F.col("code_commune_insee"))
+)
+
+df_dvf_b = F.broadcast(
+    df_dvf.select(
+        F.col("code_departement").alias("dvf_code_departement"),
+        F.col("code_commune").alias("dvf_code_commune"),
+        F.col("prix_median_m2").alias("dvf_prix_median_m2"),
+        F.col("nb_transactions").alias("dvf_nb_transactions")
+    )
+)
+
+df_dash = df_dash.join(
+    df_dvf_b,
+    (df_dash["code_departement"] == df_dvf_b["dvf_code_departement"]) &
+    (df_dash["code_commune_3"] == df_dvf_b["dvf_code_commune"]),
+    how="left"
+)
+
+df_dash = df_dash.withColumn(
+    "prix_median_m2",
+    F.coalesce(F.col("prix_median_m2"), F.col("dvf_prix_median_m2"))
+).withColumn(
+    "nb_transactions",
+    F.col("dvf_nb_transactions")
+).drop("dvf_code_departement", "dvf_code_commune", "dvf_prix_median_m2", "dvf_nb_transactions", "code_commune_3")
+
+# Colonnes calculees
+# note_lettre: A+ >0.8, A >0.7, B >0.6, C >0.5, D sinon
+df_dash = df_dash.withColumn(
+    "note_lettre",
+    F.when(F.col("score_final") > 0.8, F.lit("A+"))
+     .when(F.col("score_final") > 0.7, F.lit("A"))
+     .when(F.col("score_final") > 0.6, F.lit("B"))
+     .when(F.col("score_final") > 0.5, F.lit("C"))
+     .otherwise(F.lit("D"))
+)
+
+# concurrence_label
+df_dash = df_dash.withColumn(
+    "concurrence_label",
+    F.when(F.col("nb_clubs_5km") == 0, F.lit("Zone blanche"))
+     .when(F.col("nb_clubs_5km") <= 2, F.lit("Faible"))
+     .when(F.col("nb_clubs_5km") <= 5, F.lit("Concurrentiel"))
+     .otherwise(F.lit("Sature"))
+)
+
+# population_estimee = ind * 25
+df_dash = df_dash.withColumn(
+    "population_estimee",
+    F.round(F.col("Ind") * F.lit(25.0)).cast(IntegerType())
+)
+
+# Renommage snake_case final
+rename_map = {
+    "IdINSPIRE": "id_inspire",
+    "Latitude": "latitude",
+    "Longitude": "longitude",
+    "Men_pauv": "men_pauv",
+    "Ind_18_24": "ind_18_24",
+    "Ind_25_39": "ind_25_39",
+    "I_pauv": "i_pauv",
+    "Ind": "ind",
+    "Ind_snv": "ind_snv",
+}
+
+for old_col, new_col in rename_map.items():
+    if old_col in df_dash.columns:
+        df_dash = df_dash.withColumnRenamed(old_col, new_col)
+
+# Fillna systematique
+score_cols = [
+    "score_final", "score_concurrence", "score_accessibilite",
+    "score_immobilier", "score_revenu", "part_cible_padel",
+    "indice_demande_trends", "distance_club_plus_proche",
+    "prix_median_m2", "ind", "ind_snv", "men_pauv",
+    "ind_18_24", "ind_25_39", "i_pauv", "densite_tc", "proximite_axe"
+]
+
+for c in score_cols:
+    if c in df_dash.columns:
+        df_dash = df_dash.withColumn(c, F.coalesce(F.col(c), F.lit(0.0)))
+
+int_unknown_cols = ["stabilite_score", "nb_clubs_5km", "nb_transactions", "population_estimee"]
+for c in int_unknown_cols:
+    if c in df_dash.columns:
+        df_dash = df_dash.withColumn(c, F.coalesce(F.col(c), F.lit(-1)))
+
+string_cols = ["id_inspire", "code_commune_insee", "code_departement", "note_lettre", "concurrence_label"]
+for c in string_cols:
+    if c in df_dash.columns:
+        df_dash = df_dash.withColumn(c, F.coalesce(F.col(c).cast(StringType()), F.lit("N/A")))
+
+# Optimisation des types: float32 pour mesures (sauf lat/lon en float64)
+float32_cols = [
+    "score_final", "score_concurrence", "score_accessibilite", "score_immobilier",
+    "score_revenu", "part_cible_padel", "indice_demande_trends",
+    "distance_club_plus_proche", "prix_median_m2", "ind", "ind_snv",
+    "men_pauv", "ind_18_24", "ind_25_39", "i_pauv",
+    "densite_tc", "proximite_axe"
+]
+for c in float32_cols:
+    if c in df_dash.columns:
+        df_dash = df_dash.withColumn(c, F.col(c).cast(FloatType()))
+
+# Entiers en int16 quand possible
+int16_cols = ["stabilite_score", "nb_clubs_5km", "nb_transactions"]
+for c in int16_cols:
+    if c in df_dash.columns:
+        df_dash = df_dash.withColumn(c, F.col(c).cast(ShortType()))
+
+# population_estimee en int32 (securite volume)
+if "population_estimee" in df_dash.columns:
+    df_dash = df_dash.withColumn("population_estimee", F.col("population_estimee").cast(IntegerType()))
+
+# Selection ordonnee finale
+final_cols = [
+    "id_inspire", "code_commune_insee", "code_departement",
+    "latitude", "longitude",
+    "score_final", "score_concurrence", "score_accessibilite",
+    "score_immobilier", "score_revenu", "stabilite_score",
+    "part_cible_padel", "indice_demande_trends",
+    "distance_club_plus_proche", "nb_clubs_5km",
+    "prix_median_m2", "nb_transactions",
+    "ind", "ind_snv", "men_pauv", "ind_18_24", "ind_25_39", "i_pauv",
+    "densite_tc", "proximite_axe",
+    "note_lettre", "concurrence_label", "population_estimee"
+]
+
+df_dash_carreaux_full = df_dash.select(*[c for c in final_cols if c in df_dash.columns])
+
+# Export
+path_dash_carreaux_full = os.path.join(OUTPUT_DASH, "dash_carreaux_full")
+df_dash_carreaux_full.write \
+    .mode("overwrite") \
+    .partitionBy("code_departement") \
+    .parquet(path_dash_carreaux_full)
+
+count_dash_carreaux_full = spark.read.parquet(path_dash_carreaux_full).count()
+print(f"[1/7] dash_carreaux_full : {count_dash_carreaux_full:,} lignes")
+print(f"✅ Verification write parquet OK -> {path_dash_carreaux_full}")
+--- CELL 33 ---
+"""
+ETAPE 7 - CELLULE 2/3
+Construction des tables derivees Dash-ready:
+- dash_communes_agg
+- dash_top_zones (parquet + geojson)
+- dash_clubs (parquet + csv)
+- dash_transport
+- dash_roads
+- dash_departements_stats (parquet + csv)
+"""
+
+import os
+import json
+import geopandas as gpd
+import pandas as pd
+from pyspark.sql import Window
+import pyspark.sql.functions as F
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType, LongType, IntegerType, BooleanType
+
+path_dash_carreaux_full = os.path.join(OUTPUT_DASH, "dash_carreaux_full")
+df_dash_carreaux_full = spark.read.parquet(path_dash_carreaux_full)
+
+# [2/7] dash_communes_agg
+path_dash_communes_agg = os.path.join(OUTPUT_DASH, "dash_communes_agg")
+
+df_dash_communes_agg = df_dash_carreaux_full.groupBy("code_commune_insee").agg(
+    F.first("code_departement", ignorenulls=True).alias("code_departement"),
+    F.count("*").alias("nb_carreaux"),
+    F.avg("score_final").alias("score_final_moyen"),
+    F.max("score_final").alias("score_final_max"),
+    F.avg("score_concurrence").alias("score_concurrence_moyen"),
+    F.avg("score_accessibilite").alias("score_accessibilite_moyen"),
+    F.avg("score_immobilier").alias("score_immobilier_moyen"),
+    F.avg("score_revenu").alias("score_revenu_moyen"),
+    F.avg("part_cible_padel").alias("part_cible_padel_moyen"),
+    F.avg("indice_demande_trends").alias("indice_demande_trends_moyen"),
+    F.avg("stabilite_score").alias("stabilite_score_moyen"),
+    F.avg("latitude").alias("lat_centre"),
+    F.avg("longitude").alias("lon_centre")
+)
+
+for c in [
+    "score_final_moyen", "score_final_max", "score_concurrence_moyen", "score_accessibilite_moyen",
+    "score_immobilier_moyen", "score_revenu_moyen", "part_cible_padel_moyen",
+    "indice_demande_trends_moyen", "stabilite_score_moyen"
+]:
+    df_dash_communes_agg = df_dash_communes_agg.withColumn(c, F.coalesce(F.col(c), F.lit(0.0)))
+
+df_dash_communes_agg = df_dash_communes_agg.fillna({"code_departement": "N/A", "code_commune_insee": "N/A", "nb_carreaux": -1})
+
+df_dash_communes_agg.write.mode("overwrite").parquet(path_dash_communes_agg)
+count_dash_communes_agg = spark.read.parquet(path_dash_communes_agg).count()
+print(f"[2/7] dash_communes_agg : {count_dash_communes_agg:,} lignes")
+print(f"✅ Verification write parquet OK -> {path_dash_communes_agg}")
+
+# [3/7] dash_top_zones (parquet + geojson)
+path_dash_top_zones_parquet = os.path.join(OUTPUT_DASH, "dash_top_zones.parquet")
+path_dash_top_zones_geojson = os.path.join(OUTPUT_DASH, "dash_top_zones.geojson")
+
+# Base Spark (top 1000)
+df_top1000 = spark.read.parquet(PATHS["score_final"]).select(
+    "IdINSPIRE", "code_commune_insee", "code_departement", "Latitude", "Longitude", "score_final"
+)
+
+w_nat = Window.orderBy(F.desc("score_final"))
+w_dep = Window.partitionBy("code_departement").orderBy(F.desc("score_final"))
+
+df_top1000 = df_top1000.withColumn("rang_national", F.row_number().over(w_nat)) \
+    .withColumn("rang_departement", F.row_number().over(w_dep)) \
+    .withColumn(
+        "tier",
+        F.when(F.col("score_final") > 0.75, F.lit("Premium"))
+         .when(F.col("score_final") > 0.65, F.lit("Excellent"))
+         .when(F.col("score_final") > 0.55, F.lit("Bon"))
+         .otherwise(F.lit("Correct"))
+    ) \
+    .withColumn(
+        "label_carte",
+        F.concat(
+            F.col("code_commune_insee"),
+            F.lit(" - "),
+            F.format_string("%.0f%%", F.col("score_final") * 100.0)
+        )
+    )
+
+# Merge avec GeoJSON (petit volume => geopandas autorise)
+if os.path.exists(PATHS["top_zones_geojson"]):
+    gdf_top = gpd.read_file(PATHS["top_zones_geojson"])
+else:
+    gdf_top = gpd.GeoDataFrame(columns=["code_commune_insee", "geometry"], geometry="geometry", crs="EPSG:4326")
+
+top_pdf = df_top1000.toPandas()
+if "code_commune_insee" not in gdf_top.columns:
+    gdf_top["code_commune_insee"] = None
+
+merged_pdf = top_pdf.merge(
+    gdf_top[[c for c in ["code_commune_insee", "geometry"] if c in gdf_top.columns]],
+    on="code_commune_insee",
+    how="left"
+)
+
+# GeoDataFrame final pour export geojson
+geo_cols = [
+    "IdINSPIRE", "code_commune_insee", "code_departement", "Latitude", "Longitude", "score_final",
+    "rang_national", "rang_departement", "tier", "label_carte"
+]
+
+gdf_dash_top = gpd.GeoDataFrame(merged_pdf, geometry="geometry", crs="EPSG:4326")
+if gdf_dash_top.geometry.isna().any():
+    gdf_dash_top["geometry"] = gdf_dash_top["geometry"].where(
+        ~gdf_dash_top["geometry"].isna(),
+        gpd.points_from_xy(gdf_dash_top["Longitude"], gdf_dash_top["Latitude"], crs="EPSG:4326")
+    )
+
+gdf_dash_top.to_file(path_dash_top_zones_geojson, driver="GeoJSON")
+
+# Parquet sans geometrie
+spark.createDataFrame(merged_pdf[geo_cols]).write.mode("overwrite").parquet(path_dash_top_zones_parquet)
+count_dash_top = spark.read.parquet(path_dash_top_zones_parquet).count()
+print(f"[3/7] dash_top_zones : {count_dash_top:,} lignes")
+print(f"✅ Verification write parquet OK -> {path_dash_top_zones_parquet}")
+
+# [4/7] dash_clubs
+path_dash_clubs_parquet = os.path.join(OUTPUT_DASH, "dash_clubs.parquet")
+path_dash_clubs_csv = os.path.join(OUTPUT_DASH, "dash_clubs.csv")
+
+conc_path = _first_existing_path([
+    PATHS["concurrence_padel"],
+    "/home/jovyan/work/data/output/concurrence_padel/"
+])
+if conc_path is None:
+    raise FileNotFoundError("Aucun chemin concurrence_padel valide trouve.")
+
+annexe_path = _first_existing_path([
+    PATHS["clubs_concurrents"],
+    "/home/jovyan/work/data/output/clubs_concurrents/"
+])
+if annexe_path is None:
+    raise FileNotFoundError("Aucun chemin clubs_concurrents valide trouve.")
+
+df_conc_main = spark.read.parquet(conc_path).select(
+    F.coalesce(F.col("Nom"), F.lit("N/A")).alias("nom"),
+    F.coalesce(F.col("Type"), F.lit("N/A")).alias("type"),
+    F.coalesce(F.col("Commune"), F.lit("N/A")).alias("commune"),
+    F.col("Latitude").cast(DoubleType()).alias("latitude"),
+    F.col("Longitude").cast(DoubleType()).alias("longitude"),
+    F.col("Nombre_de_courts").cast(IntegerType()).alias("nombre_de_courts"),
+    F.coalesce(F.col("Source"), F.lit("N/A")).alias("source"),
+    F.coalesce(F.col("DepartementCode"), F.lit("N/A")).alias("departement_code")
+).withColumn("source_principale", F.lit(True))
+
+# Table annexe potentiellement heterogene
+try:
+    df_conc_annexe_raw = spark.read.parquet(annexe_path)
+except Exception:
+    df_conc_annexe_raw = spark.createDataFrame([], df_conc_main.schema)
+
+for needed, fallback in [
+    ("Nom", "nom"),
+    ("Type", "type"),
+    ("Commune", "commune"),
+    ("Latitude", "latitude"),
+    ("Longitude", "longitude"),
+    ("Nombre_de_courts", "nombre_de_courts"),
+    ("Source", "source"),
+    ("DepartementCode", "departement_code"),
+]:
+    if needed not in df_conc_annexe_raw.columns:
+        if fallback in df_conc_annexe_raw.columns:
+            df_conc_annexe_raw = df_conc_annexe_raw.withColumnRenamed(fallback, needed)
+        else:
+            df_conc_annexe_raw = df_conc_annexe_raw.withColumn(needed, F.lit(None))
+
+df_conc_annexe = df_conc_annexe_raw.select(
+    F.coalesce(F.col("Nom"), F.lit("N/A")).alias("nom"),
+    F.coalesce(F.col("Type"), F.lit("N/A")).alias("type"),
+    F.coalesce(F.col("Commune"), F.lit("N/A")).alias("commune"),
+    F.col("Latitude").cast(DoubleType()).alias("latitude"),
+    F.col("Longitude").cast(DoubleType()).alias("longitude"),
+    F.col("Nombre_de_courts").cast(IntegerType()).alias("nombre_de_courts"),
+    F.coalesce(F.col("Source"), F.lit("N/A")).alias("source"),
+    F.coalesce(F.col("DepartementCode"), F.lit("N/A")).alias("departement_code")
+).withColumn("source_principale", F.lit(False))
+
+df_clubs_union = df_conc_main.unionByName(df_conc_annexe, allowMissingColumns=True) \
+    .filter(F.col("latitude").isNotNull() & F.col("longitude").isNotNull())
+
+# Dedup GPS arrondi 3 decimales avec priorite a concurrence_padel
+df_clubs_union = df_clubs_union.withColumn("lat3", F.round("latitude", 3)) \
+    .withColumn("lon3", F.round("longitude", 3))
+
+w_dedup = Window.partitionBy("lat3", "lon3").orderBy(F.desc("source_principale"), F.col("nombre_de_courts").desc_nulls_last())
+df_clubs_dedup = df_clubs_union.withColumn("rn", F.row_number().over(w_dedup)) \
+    .filter(F.col("rn") == 1) \
+    .drop("rn", "lat3", "lon3")
+
+# Enrichissement par carreau proche (jointure approx sur arrondi 2 decimales + broadcast)
+df_clubs_dedup = df_clubs_dedup.withColumn("club_id", F.monotonically_increasing_id()) \
+    .withColumn("lat2", F.round("latitude", 2)) \
+    .withColumn("lon2", F.round("longitude", 2))
+
+df_carreaux_small = df_dash_carreaux_full.select(
+    F.round("latitude", 2).alias("lat2"),
+    F.round("longitude", 2).alias("lon2"),
+    "score_final", "score_revenu", "prix_median_m2", "indice_demande_trends",
+    "part_cible_padel", "ind_snv", "nb_clubs_5km", "code_departement"
+)
+
+df_club_match = df_clubs_dedup.join(
+    F.broadcast(df_carreaux_small),
+    on=["lat2", "lon2"],
+    how="left"
+)
+
+# Si plusieurs matches, garder le meilleur score_final
+w_match = Window.partitionBy("club_id").orderBy(F.col("score_final").desc_nulls_last())
+df_club_match = df_club_match.withColumn("rn_match", F.row_number().over(w_match)) \
+    .filter(F.col("rn_match") == 1) \
+    .drop("rn_match", "lat2", "lon2")
+
+df_dash_clubs = df_club_match.withColumn(
+    "zone_saturee",
+    F.when(F.col("nb_clubs_5km") > 5, F.lit(True)).otherwise(F.lit(False))
+).withColumn(
+    "score_zone_implantation",
+    F.coalesce(F.col("score_final"), F.lit(0.0))
+).select(
+    "nom", "type", "commune", "latitude", "longitude",
+    "nombre_de_courts", "source", "departement_code",
+    "source_principale", "score_zone_implantation",
+    F.coalesce(F.col("ind_snv"), F.lit(0.0)).alias("ind_snv_zone"),
+    F.coalesce(F.col("prix_median_m2"), F.lit(0.0)).alias("prix_median_m2_zone"),
+    F.coalesce(F.col("indice_demande_trends"), F.lit(0.0)).alias("indice_demande_trends_zone"),
+    F.coalesce(F.col("part_cible_padel"), F.lit(0.0)).alias("part_cible_padel_zone"),
+    "zone_saturee"
+)
+
+# Fillna systematique
+for c in ["score_zone_implantation", "ind_snv_zone", "prix_median_m2_zone", "indice_demande_trends_zone", "part_cible_padel_zone"]:
+    df_dash_clubs = df_dash_clubs.withColumn(c, F.coalesce(F.col(c), F.lit(0.0)))
+for c in ["nom", "type", "commune", "source", "departement_code"]:
+    df_dash_clubs = df_dash_clubs.withColumn(c, F.coalesce(F.col(c), F.lit("N/A")))
+
+df_dash_clubs.write.mode("overwrite").parquet(path_dash_clubs_parquet)
+df_dash_clubs.coalesce(1).write.mode("overwrite").option("header", True).csv(path_dash_clubs_csv)
+count_dash_clubs = spark.read.parquet(path_dash_clubs_parquet).count()
+print(f"[4/7] dash_clubs : {count_dash_clubs:,} lignes")
+print(f"✅ Verification write parquet OK -> {path_dash_clubs_parquet}")
+
+# [5/7] dash_transport
+path_dash_transport = os.path.join(OUTPUT_DASH, "dash_transport.parquet")
+
+transport_schema = StructType([
+    StructField("osm_id", LongType(), True),
+    StructField("type_transport", StringType(), True),
+    StructField("latitude", DoubleType(), True),
+    StructField("longitude", DoubleType(), True),
+])
+
+df_transport = spark.read.option("header", True).schema(transport_schema).csv(PATHS["osm_transport"]) \
+    .filter(
+        F.col("latitude").between(41.0, 51.5) &
+        F.col("longitude").between(-5.0, 10.0)
+    )
+
+df_transport = df_transport.withColumn("lat4", F.round("latitude", 4)) \
+    .withColumn("lon4", F.round("longitude", 4))
+
+w_tp = Window.partitionBy("lat4", "lon4").orderBy(F.col("osm_id"))
+df_transport = df_transport.withColumn("rn", F.row_number().over(w_tp)) \
+    .filter(F.col("rn") == 1) \
+    .drop("rn")
+
+df_transport = df_transport.withColumn(
+    "type_transport_label",
+    F.when(F.lower(F.col("type_transport")).rlike("subway|rail"), F.lit("Metro/RER"))
+     .when(F.lower(F.col("type_transport")).rlike("bus"), F.lit("Bus"))
+     .when(F.lower(F.col("type_transport")).rlike("tram"), F.lit("Tram"))
+     .when(F.lower(F.col("type_transport")).rlike("station"), F.lit("Gare"))
+     .otherwise(F.lit("Autre"))
+)
+
+# Echantillonnage stratifie <=100k
+max_transport = 100000
+current_transport = df_transport.count()
+if current_transport > max_transport:
+    counts_tp = {r["type_transport"]: r["count"] for r in df_transport.groupBy("type_transport").count().collect()}
+    fractions = {k: min(1.0, float(max_transport) / float(current_transport)) for k in counts_tp.keys()}
+    df_transport = df_transport.sampleBy("type_transport", fractions=fractions, seed=42)
+
+df_transport = df_transport.drop("lat4", "lon4")
+df_transport.write.mode("overwrite").parquet(path_dash_transport)
+count_dash_transport = spark.read.parquet(path_dash_transport).count()
+print(f"[5/7] dash_transport : {count_dash_transport:,} lignes")
+print(f"✅ Verification write parquet OK -> {path_dash_transport}")
+
+# [6/7] dash_roads
+path_dash_roads = os.path.join(OUTPUT_DASH, "dash_roads.parquet")
+
+roads_schema = StructType([
+    StructField("osm_id", LongType(), True),
+    StructField("type_voie", StringType(), True),
+    StructField("latitude_centroid", DoubleType(), True),
+    StructField("longitude_centroid", DoubleType(), True),
+])
+
+df_roads = spark.read.option("header", True).schema(roads_schema).csv(PATHS["osm_roads"]) \
+    .filter(
+        F.col("latitude_centroid").between(41.0, 51.5) &
+        F.col("longitude_centroid").between(-5.0, 10.0)
+    ) \
+    .filter(F.col("type_voie").isin("motorway", "trunk")) \
+    .withColumnRenamed("latitude_centroid", "latitude") \
+    .withColumnRenamed("longitude_centroid", "longitude")
+
+max_roads = 50000
+n_roads = df_roads.count()
+if n_roads > max_roads:
+    frac = float(max_roads) / float(n_roads)
+    df_roads = df_roads.sample(withReplacement=False, fraction=frac, seed=42)
+
+df_roads.write.mode("overwrite").parquet(path_dash_roads)
+count_dash_roads = spark.read.parquet(path_dash_roads).count()
+print(f"[6/7] dash_roads : {count_dash_roads:,} lignes")
+print(f"✅ Verification write parquet OK -> {path_dash_roads}")
+
+# [7/7] dash_departements_stats
+path_dash_deps_parquet = os.path.join(OUTPUT_DASH, "dash_departements_stats.parquet")
+path_dash_deps_csv = os.path.join(OUTPUT_DASH, "dash_departements_stats.csv")
+
+# stats principales
+quant_expr = "percentile_approx(score_final, array(0.5, 0.9), 10000)"
+
+df_dep_base = df_dash_carreaux_full.groupBy("code_departement").agg(
+    F.count("*").alias("nb_carreaux_total"),
+    F.max("score_final").alias("score_final_max"),
+    F.expr(quant_expr).alias("score_q"),
+    F.expr("percentile_approx(score_concurrence, 0.5, 10000)").alias("score_concurrence_median"),
+    F.expr("percentile_approx(score_accessibilite, 0.5, 10000)").alias("score_accessibilite_median"),
+    F.expr("percentile_approx(score_immobilier, 0.5, 10000)").alias("score_immobilier_median"),
+    F.expr("percentile_approx(score_revenu, 0.5, 10000)").alias("score_revenu_median"),
+    F.expr("percentile_approx(ind_snv, 0.5, 10000)").alias("ind_snv_median"),
+    F.expr("percentile_approx(prix_median_m2, 0.5, 10000)").alias("prix_median_m2_median"),
+    F.expr("percentile_approx(indice_demande_trends, 0.5, 10000)").alias("indice_demande_trends_median")
+).withColumn(
+    "score_final_median", F.col("score_q")[0]
+).withColumn(
+    "score_final_p90", F.col("score_q")[1]
+).drop("score_q")
+
+# nb_carreaux_top10pct par departement (>= p90)
+df_dep_threshold = df_dep_base.select("code_departement", "score_final_p90")
+df_top10 = df_dash_carreaux_full.join(df_dep_threshold, on="code_departement", how="left") \
+    .filter(F.col("score_final") >= F.col("score_final_p90")) \
+    .groupBy("code_departement") \
+    .agg(F.count("*").alias("nb_carreaux_top10pct"))
+
+# Top commune par departement
+w_top_comm = Window.partitionBy("code_departement").orderBy(F.col("score_final").desc_nulls_last())
+df_top_comm = df_dash_carreaux_full.select("code_departement", "code_commune_insee", "score_final") \
+    .withColumn("rn", F.row_number().over(w_top_comm)) \
+    .filter(F.col("rn") == 1) \
+    .select(
+        "code_departement",
+        F.col("code_commune_insee").alias("top_commune"),
+        F.col("score_final").alias("top_score")
+    )
+
+# nb clubs par departement
+if os.path.exists(path_dash_clubs_parquet):
+    df_dash_clubs = spark.read.parquet(path_dash_clubs_parquet)
+    df_dep_clubs = df_dash_clubs.groupBy("departement_code").agg(F.count("*").alias("nb_clubs_total")) \
+        .withColumnRenamed("departement_code", "code_departement")
+else:
+    df_dep_clubs = spark.createDataFrame([], "code_departement string, nb_clubs_total long")
+
+df_dash_deps = df_dep_base.join(df_top10, on="code_departement", how="left") \
+    .join(df_dep_clubs, on="code_departement", how="left") \
+    .join(df_top_comm, on="code_departement", how="left")
+
+df_dash_deps = df_dash_deps.withColumn("nb_carreaux_top10pct", F.coalesce(F.col("nb_carreaux_top10pct"), F.lit(0))) \
+    .withColumn("nb_clubs_total", F.coalesce(F.col("nb_clubs_total"), F.lit(0))) \
+    .withColumn("top_commune", F.coalesce(F.col("top_commune"), F.lit("N/A"))) \
+    .withColumn("top_score", F.coalesce(F.col("top_score"), F.lit(0.0)))
+
+df_dash_deps = df_dash_deps.withColumn(
+    "opportunite_label",
+    F.when(F.col("score_final_p90") > 0.7, F.lit("Top opportunite"))
+     .when(F.col("score_final_p90") > 0.6, F.lit("Bon potentiel"))
+     .when(F.col("score_final_p90") > 0.5, F.lit("Potentiel limite"))
+     .otherwise(F.lit("Marche difficile"))
+)
+
+# Fillna final
+df_dash_deps = df_dash_deps.fillna({
+    "code_departement": "N/A",
+    "nb_carreaux_total": -1,
+    "nb_carreaux_top10pct": -1,
+    "score_final_median": 0.0,
+    "score_final_p90": 0.0,
+    "score_final_max": 0.0,
+    "score_concurrence_median": 0.0,
+    "score_accessibilite_median": 0.0,
+    "score_immobilier_median": 0.0,
+    "score_revenu_median": 0.0,
+    "ind_snv_median": 0.0,
+    "prix_median_m2_median": 0.0,
+    "indice_demande_trends_median": 0.0,
+    "nb_clubs_total": -1,
+    "top_commune": "N/A",
+    "top_score": 0.0,
+    "opportunite_label": "N/A",
+})
+
+df_dash_deps.write.mode("overwrite").parquet(path_dash_deps_parquet)
+df_dash_deps.coalesce(1).write.mode("overwrite").option("header", True).csv(path_dash_deps_csv)
+count_dash_deps = spark.read.parquet(path_dash_deps_parquet).count()
+print(f"[7/7] dash_departements_stats : {count_dash_deps:,} lignes")
+print(f"✅ Verification write parquet OK -> {path_dash_deps_parquet}")
+--- CELL 34 ---
+"""
+ETAPE 7 - CELLULE 3/3
+Generation de dash_metadata.json :
+- Volumes globaux, stats de score, tops departements/communes.
+- Taille des datasets produits.
+- Recapitulatif final imprime.
+"""
+
+import os
+import json
+from datetime import datetime, timezone
+import pyspark.sql.functions as F
+
+# Paths des tables produites
+path_dash_carreaux_full = os.path.join(OUTPUT_DASH, "dash_carreaux_full")
+path_dash_communes_agg = os.path.join(OUTPUT_DASH, "dash_communes_agg")
+path_dash_top_zones_parquet = os.path.join(OUTPUT_DASH, "dash_top_zones.parquet")
+path_dash_clubs_parquet = os.path.join(OUTPUT_DASH, "dash_clubs.parquet")
+path_dash_transport = os.path.join(OUTPUT_DASH, "dash_transport.parquet")
+path_dash_roads = os.path.join(OUTPUT_DASH, "dash_roads.parquet")
+path_dash_deps_parquet = os.path.join(OUTPUT_DASH, "dash_departements_stats.parquet")
+path_dash_metadata = os.path.join(OUTPUT_DASH, "dash_metadata.json")
+
+# Lecture tables
+df_carreaux = spark.read.parquet(path_dash_carreaux_full)
+df_communes = spark.read.parquet(path_dash_communes_agg)
+df_top_zones = spark.read.parquet(path_dash_top_zones_parquet)
+df_clubs = spark.read.parquet(path_dash_clubs_parquet)
+df_deps = spark.read.parquet(path_dash_deps_parquet)
+
+# Helper taille
+
+def _path_size_bytes(path):
+    if not os.path.exists(path):
+        return 0
+    if os.path.isfile(path):
+        return os.path.getsize(path)
+    total = 0
+    for root, _, files in os.walk(path):
+        for fn in files:
+            fp = os.path.join(root, fn)
+            if os.path.isfile(fp):
+                total += os.path.getsize(fp)
+    return total
+
+
+# Volumes
+nb_carreaux_total = df_carreaux.count()
+nb_communes = df_communes.count()
+nb_departements = df_deps.select("code_departement").distinct().count()
+nb_clubs = df_clubs.count()
+nb_top_zones = df_top_zones.count()
+
+# Stats score_final
+aqq = df_carreaux.agg(
+    F.min("score_final").alias("min_v"),
+    F.max("score_final").alias("max_v"),
+    F.expr("percentile_approx(score_final, array(0.5, 0.9, 0.99), 10000)").alias("q")
+).collect()[0]
+
+score_final_min = float(aqq["min_v"]) if aqq["min_v"] is not None else 0.0
+score_final_max = float(aqq["max_v"]) if aqq["max_v"] is not None else 0.0
+score_final_median = float(aqq["q"][0]) if aqq["q"] is not None else 0.0
+score_final_p90 = float(aqq["q"][1]) if aqq["q"] is not None else 0.0
+score_final_p99 = float(aqq["q"][2]) if aqq["q"] is not None else 0.0
+
+# Tops
+top5_departements = [
+    r["code_departement"]
+    for r in df_deps.orderBy(F.desc("score_final_p90")).select("code_departement").limit(5).collect()
+]
+
+top5_communes = [
+    r["code_commune_insee"]
+    for r in df_communes.orderBy(F.desc("score_final_max")).select("code_commune_insee").limit(5).collect()
+]
+
+# Infos tables
+tables_info = {
+    "dash_carreaux_full": {
+        "path": path_dash_carreaux_full,
+        "nb_lignes": int(nb_carreaux_total),
+        "taille_mo": _bytes_to_mb(_path_size_bytes(path_dash_carreaux_full)),
+    },
+    "dash_communes_agg": {
+        "path": path_dash_communes_agg,
+        "nb_lignes": int(nb_communes),
+        "taille_mo": _bytes_to_mb(_path_size_bytes(path_dash_communes_agg)),
+    },
+    "dash_top_zones": {
+        "path": path_dash_top_zones_parquet,
+        "nb_lignes": int(nb_top_zones),
+        "taille_mo": _bytes_to_mb(_path_size_bytes(path_dash_top_zones_parquet)),
+    },
+    "dash_clubs": {
+        "path": path_dash_clubs_parquet,
+        "nb_lignes": int(nb_clubs),
+        "taille_mo": _bytes_to_mb(_path_size_bytes(path_dash_clubs_parquet)),
+    },
+    "dash_transport": {
+        "path": path_dash_transport,
+        "nb_lignes": int(spark.read.parquet(path_dash_transport).count()),
+        "taille_mo": _bytes_to_mb(_path_size_bytes(path_dash_transport)),
+    },
+    "dash_roads": {
+        "path": path_dash_roads,
+        "nb_lignes": int(spark.read.parquet(path_dash_roads).count()),
+        "taille_mo": _bytes_to_mb(_path_size_bytes(path_dash_roads)),
+    },
+    "dash_departements_stats": {
+        "path": path_dash_deps_parquet,
+        "nb_lignes": int(nb_departements),
+        "taille_mo": _bytes_to_mb(_path_size_bytes(path_dash_deps_parquet)),
+    },
+}
+
+metadata = {
+    "generated_at": datetime.now(timezone.utc).isoformat(),
+    "volumes": {
+        "nb_carreaux_total": int(nb_carreaux_total),
+        "nb_communes": int(nb_communes),
+        "nb_departements": int(nb_departements),
+        "nb_clubs": int(nb_clubs),
+        "nb_top_zones": int(nb_top_zones),
+    },
+    "score_stats": {
+        "score_final_min": score_final_min,
+        "score_final_max": score_final_max,
+        "score_final_median": score_final_median,
+        "score_final_p90": score_final_p90,
+        "score_final_p99": score_final_p99,
+    },
+    "top5_departements": top5_departements,
+    "top5_communes": top5_communes,
+    "tables": tables_info,
+}
+
+with open(path_dash_metadata, "w", encoding="utf-8") as f:
+    json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+# Recap final
+nb_tables = 7
+taille_totale_mo = sum(v.get("taille_mo", 0.0) for v in tables_info.values())
+top_dept = top5_departements[0] if top5_departements else "N/A"
+top_commune = top5_communes[0] if top5_communes else "N/A"
+
+print(f"✅ {nb_tables} tables Dash-ready generees")
+print(f"✅ Volume total : {taille_totale_mo:.0f} Mo")
+print(f"✅ Top departement : {top_dept}")
+print(f"✅ Meilleure commune : {top_commune}")
+print(f"✅ Metadata JSON : {path_dash_metadata}")
+--- CELL 35 ---
+"""
+ETAPE 8 - Bundle Plotly (1 fichier ZIP + quelques fichiers pivots)
+Objectif: reduire la fragmentation des sorties pour un usage Plotly simple.
+Sorties:
+- plotly_bundle/plotly_master_communes.csv
+- plotly_bundle/plotly_top_zones.csv
+- plotly_bundle/plotly_departements.csv
+- plotly_bundle/plotly_top_zones.geojson
+- plotly_bundle/plotly_bundle.zip
+"""
+
+import os
+import zipfile
+import geopandas as gpd
+import pyspark.sql.functions as F
+
+# Dossiers de travail
+plotly_bundle_dir = os.path.join(OUTPUT_DASH, "plotly_bundle")
+os.makedirs(plotly_bundle_dir, exist_ok=True)
+
+# Sources dash_ready
+path_dash_communes_agg = os.path.join(OUTPUT_DASH, "dash_communes_agg")
+path_dash_top_zones_parquet = os.path.join(OUTPUT_DASH, "dash_top_zones.parquet")
+path_dash_top_zones_geojson = os.path.join(OUTPUT_DASH, "dash_top_zones.geojson")
+path_dash_deps_parquet = os.path.join(OUTPUT_DASH, "dash_departements_stats.parquet")
+
+# Cibles consolidees
+path_plotly_master_csv = os.path.join(plotly_bundle_dir, "plotly_master_communes.csv")
+path_plotly_top_csv = os.path.join(plotly_bundle_dir, "plotly_top_zones.csv")
+path_plotly_deps_csv = os.path.join(plotly_bundle_dir, "plotly_departements.csv")
+path_plotly_geojson = os.path.join(plotly_bundle_dir, "plotly_top_zones.geojson")
+path_plotly_readme = os.path.join(plotly_bundle_dir, "README_plotly_bundle.txt")
+path_plotly_zip = os.path.join(plotly_bundle_dir, "plotly_bundle.zip")
+
+# Lecture des tables finales
+# 1) communes agg (table maitre pour charts/carte)
+df_communes = spark.read.parquet(path_dash_communes_agg)
+
+# 2) stats departement
+if os.path.exists(path_dash_deps_parquet):
+    df_deps = spark.read.parquet(path_dash_deps_parquet).select(
+        "code_departement",
+        "opportunite_label",
+        "score_final_p90",
+        F.col("score_final_max").alias("dep_score_final_max"),
+        "nb_clubs_total"
+    )
+else:
+    df_deps = spark.createDataFrame([], "code_departement string, opportunite_label string, score_final_p90 double, dep_score_final_max double, nb_clubs_total long")
+
+# Jointure commune + contexte departement
+df_master = df_communes.join(df_deps, on="code_departement", how="left")
+
+df_master = df_master.fillna({
+    "code_departement": "N/A",
+    "code_commune_insee": "N/A",
+    "nb_carreaux": -1,
+    "score_final_moyen": 0.0,
+    "score_final_max": 0.0,
+    "score_concurrence_moyen": 0.0,
+    "score_accessibilite_moyen": 0.0,
+    "score_immobilier_moyen": 0.0,
+    "score_revenu_moyen": 0.0,
+    "part_cible_padel_moyen": 0.0,
+    "indice_demande_trends_moyen": 0.0,
+    "stabilite_score_moyen": 0.0,
+    "lat_centre": 0.0,
+    "lon_centre": 0.0,
+    "opportunite_label": "N/A",
+    "score_final_p90": 0.0,
+    "dep_score_final_max": 0.0,
+    "nb_clubs_total": -1,
+})
+
+# Export CSV unique "master"
+df_master.coalesce(1).write.mode("overwrite").option("header", True).csv(path_plotly_master_csv)
+print(f"✅ plotly_master_communes.csv exporte -> {path_plotly_master_csv}")
+
+# 3) top zones (CSV + GeoJSON)
+if os.path.exists(path_dash_top_zones_parquet):
+    df_top = spark.read.parquet(path_dash_top_zones_parquet)
+    df_top = df_top.fillna({
+        "code_commune_insee": "N/A",
+        "code_departement": "N/A",
+        "tier": "Correct",
+        "label_carte": "N/A",
+        "score_final": 0.0,
+        "rang_national": -1,
+        "rang_departement": -1,
+    })
+    df_top.coalesce(1).write.mode("overwrite").option("header", True).csv(path_plotly_top_csv)
+    print(f"✅ plotly_top_zones.csv exporte -> {path_plotly_top_csv}")
+else:
+    print("⚠️ dash_top_zones.parquet introuvable, CSV top zones non genere.")
+
+if os.path.exists(path_dash_top_zones_geojson):
+    gdf_top = gpd.read_file(path_dash_top_zones_geojson)
+    gdf_top.to_file(path_plotly_geojson, driver="GeoJSON")
+    print(f"✅ plotly_top_zones.geojson exporte -> {path_plotly_geojson}")
+else:
+    print("⚠️ dash_top_zones.geojson introuvable.")
+
+# 4) departements CSV
+if os.path.exists(path_dash_deps_parquet):
+    spark.read.parquet(path_dash_deps_parquet).coalesce(1).write.mode("overwrite").option("header", True).csv(path_plotly_deps_csv)
+    print(f"✅ plotly_departements.csv exporte -> {path_plotly_deps_csv}")
+else:
+    print("⚠️ dash_departements_stats.parquet introuvable.")
+
+# README pour usage rapide
+readme_text = """
+Plotly Bundle - PadelSpot
+
+Fichiers principaux:
+1) plotly_master_communes.csv : table maitre pour la plupart des graphes Plotly
+2) plotly_top_zones.csv : top zones candidates (classements)
+3) plotly_departements.csv : stats departementales
+4) plotly_top_zones.geojson : geometries carte
+
+Conseil usage Plotly:
+- Charger d'abord plotly_master_communes.csv
+- Pour carte, joindre plotly_top_zones.csv + plotly_top_zones.geojson sur code_commune_insee
+""".strip()
+
+with open(path_plotly_readme, "w", encoding="utf-8") as f:
+    f.write(readme_text)
+
+# Zip final: un seul fichier a transporter
+if os.path.exists(path_plotly_zip):
+    os.remove(path_plotly_zip)
+
+with zipfile.ZipFile(path_plotly_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    for root, _, files in os.walk(plotly_bundle_dir):
+        for fname in files:
+            full_path = os.path.join(root, fname)
+            if os.path.abspath(full_path) == os.path.abspath(path_plotly_zip):
+                continue
+            arcname = os.path.relpath(full_path, plotly_bundle_dir)
+            zf.write(full_path, arcname)
+
+zip_size_mo = round(os.path.getsize(path_plotly_zip) / (1024.0 * 1024.0), 2)
+print("\n🎯 Bundle Plotly pret")
+print(f"- Dossier: {plotly_bundle_dir}")
+print(f"- ZIP unique: {path_plotly_zip} ({zip_size_mo} Mo)")
+print("- Tu peux maintenant utiliser un seul ZIP ou juste plotly_master_communes.csv pour commencer.")
+--- CELL 36 ---
+"""
+ETAPE 9 - Fix carte Plotly
+- Genere un CSV communes lisible (markers limites)
+- Genere un CSV clubs pour afficher les points padel
+- Met a jour le ZIP du bundle
+"""
+
+import os
+import zipfile
+import pandas as pd
+
+bundle_dir = "/home/jovyan/work/data/dash_ready/plotly_bundle"
+unified_csv = f"{bundle_dir}/plotly_unified.csv"
+clubs_csv_src = "/home/jovyan/work/data/dash_ready/dash_clubs.csv/part-00000-fa44d60d-0c5b-428a-b1ed-a24b693f9e69-c000.csv"
+
+plotly_map_communes = f"{bundle_dir}/plotly_map_communes.csv"
+plotly_map_clubs = f"{bundle_dir}/plotly_map_clubs.csv"
+plotly_zip = f"{bundle_dir}/plotly_bundle.zip"
+
+# 1) Communes map-ready
+if not os.path.exists(unified_csv):
+    raise FileNotFoundError(f"Fichier introuvable: {unified_csv}")
+
+df_u = pd.read_csv(unified_csv)
+
+for c in ["lat_centre", "lon_centre", "score_final_moyen", "score_accessibilite_moyen", "score_concurrence_moyen"]:
+    if c in df_u.columns:
+        df_u[c] = pd.to_numeric(df_u[c], errors="coerce")
+
+# France metropolitaine + valeurs valides
+df_u = df_u[
+    df_u["lat_centre"].between(41.0, 51.5) &
+    df_u["lon_centre"].between(-5.5, 10.5)
+].copy()
+
+# Dedup stricte 1 ligne par commune
+group_cols = ["code_departement", "code_commune_insee"]
+agg_map = {
+    "lat_centre": "mean",
+    "lon_centre": "mean",
+    "score_final_moyen": "mean",
+    "score_accessibilite_moyen": "mean",
+    "score_concurrence_moyen": "mean",
+}
+
+df_map_communes = df_u.groupby(group_cols, as_index=False).agg(agg_map)
+
+# Taille marqueur lisible (6 a 16)
+df_map_communes["marker_size"] = (6.0 + (df_map_communes["score_final_moyen"].clip(lower=0, upper=1) * 10.0)).round(2)
+df_map_communes["marker_opacity"] = 0.55
+
+df_map_communes = df_map_communes.sort_values(["code_departement", "code_commune_insee"])
+df_map_communes.to_csv(plotly_map_communes, index=False)
+
+# 2) Clubs map-ready
+if not os.path.exists(clubs_csv_src):
+    # fallback: prend le premier part-*.csv
+    clubs_dir = "/home/jovyan/work/data/dash_ready/dash_clubs.csv"
+    parts = sorted([f for f in os.listdir(clubs_dir) if f.startswith("part-") and f.endswith(".csv")])
+    if not parts:
+        raise FileNotFoundError("Aucun CSV clubs trouve dans /home/jovyan/work/data/dash_ready/dash_clubs.csv")
+    clubs_csv_src = f"{clubs_dir}/{parts[0]}"
+
+df_clubs = pd.read_csv(clubs_csv_src)
+for c in ["latitude", "longitude", "score_zone_implantation"]:
+    if c in df_clubs.columns:
+        df_clubs[c] = pd.to_numeric(df_clubs[c], errors="coerce")
+
+df_map_clubs = df_clubs[
+    df_clubs["latitude"].between(41.0, 51.5) &
+    df_clubs["longitude"].between(-5.5, 10.5)
+].copy()
+
+club_keep = [
+    "nom", "type", "commune", "departement_code",
+    "latitude", "longitude", "source_principale",
+    "score_zone_implantation", "zone_saturee"
+]
+club_keep = [c for c in club_keep if c in df_map_clubs.columns]
+df_map_clubs = df_map_clubs[club_keep]
+df_map_clubs.to_csv(plotly_map_clubs, index=False)
+
+# 3) Update ZIP bundle
+if os.path.exists(plotly_zip):
+    os.remove(plotly_zip)
+
+with zipfile.ZipFile(plotly_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    for root, _, files in os.walk(bundle_dir):
+        for fn in files:
+            full = os.path.join(root, fn)
+            if os.path.abspath(full) == os.path.abspath(plotly_zip):
+                continue
+            zf.write(full, arcname=os.path.relpath(full, bundle_dir))
+
+print(f"✅ plotly_map_communes.csv : {len(df_map_communes):,} lignes")
+print(f"✅ plotly_map_clubs.csv    : {len(df_map_clubs):,} lignes")
+print(f"✅ ZIP mis a jour          : {plotly_zip}")
+--- CELL 37 ---
+"""
+ETAPE 10 - CSV unique pour Plotly (communes + clubs)
+But: Plotly ne lit qu'un CSV => produire un seul fichier map_points_onefile.csv
+"""
+
+import os
+import pandas as pd
+
+bundle_dir = "/home/jovyan/work/data/dash_ready/plotly_bundle"
+unified_csv = f"{bundle_dir}/plotly_unified.csv"
+clubs_dir = "/home/jovyan/work/data/dash_ready/dash_clubs.csv"
+out_csv = f"{bundle_dir}/map_points_onefile.csv"
+
+if not os.path.exists(unified_csv):
+    raise FileNotFoundError(f"Introuvable: {unified_csv}")
+
+club_parts = sorted([f for f in os.listdir(clubs_dir) if f.startswith("part-") and f.endswith(".csv")])
+if not club_parts:
+    raise FileNotFoundError(f"Aucun part-*.csv dans {clubs_dir}")
+clubs_csv = f"{clubs_dir}/{club_parts[0]}"
+
+# Communes
+df_comm = pd.read_csv(unified_csv)
+for c in ["lat_centre", "lon_centre", "score_final_moyen", "score_accessibilite_moyen", "score_concurrence_moyen", "indice_demande_trends_moyen"]:
+    if c in df_comm.columns:
+        df_comm[c] = pd.to_numeric(df_comm[c], errors="coerce")
+
+df_comm = df_comm[
+    df_comm["lat_centre"].between(41.0, 51.5) &
+    df_comm["lon_centre"].between(-5.5, 10.5)
+].copy()
+
+# 1 ligne par commune
+df_comm = df_comm.groupby(["code_departement", "code_commune_insee"], as_index=False).agg({
+    "lat_centre": "mean",
+    "lon_centre": "mean",
+    "score_final_moyen": "mean",
+    "score_accessibilite_moyen": "mean",
+    "score_concurrence_moyen": "mean",
+    "indice_demande_trends_moyen": "mean",
+})
+
+df_comm_out = pd.DataFrame({
+    "type_point": "commune",
+    "code_departement": df_comm["code_departement"],
+    "code_commune_insee": df_comm["code_commune_insee"],
+    "nom": "",
+    "commune": df_comm["code_commune_insee"],
+    "latitude": df_comm["lat_centre"].round(6),
+    "longitude": df_comm["lon_centre"].round(6),
+    "score_final": df_comm["score_final_moyen"].fillna(0).round(6),
+    "score_accessibilite": df_comm["score_accessibilite_moyen"].fillna(0).round(6),
+    "score_concurrence": df_comm["score_concurrence_moyen"].fillna(0).round(6),
+    "demande_trends": df_comm["indice_demande_trends_moyen"].fillna(0).round(3),
+})
+df_comm_out["marker_size"] = (4 + df_comm_out["score_final"].clip(0, 1) * 10).clip(4, 16).round(2)
+df_comm_out["marker_opacity"] = 0.45
+df_comm_out["marker_symbol"] = "circle"
+df_comm_out["label"] = "Commune " + df_comm_out["code_commune_insee"].astype(str)
+
+# Clubs
+df_clubs = pd.read_csv(clubs_csv)
+for c in ["latitude", "longitude", "score_zone_implantation"]:
+    if c in df_clubs.columns:
+        df_clubs[c] = pd.to_numeric(df_clubs[c], errors="coerce")
+
+df_clubs = df_clubs[
+    df_clubs["latitude"].between(41.0, 51.5) &
+    df_clubs["longitude"].between(-5.5, 10.5)
+].copy()
+
+df_clubs_out = pd.DataFrame({
+    "type_point": "club",
+    "code_departement": df_clubs.get("departement_code", ""),
+    "code_commune_insee": "",
+    "nom": df_clubs.get("nom", ""),
+    "commune": df_clubs.get("commune", ""),
+    "latitude": df_clubs["latitude"].round(6),
+    "longitude": df_clubs["longitude"].round(6),
+    "score_final": pd.to_numeric(df_clubs.get("score_zone_implantation", 0), errors="coerce").fillna(0).round(6),
+    "score_accessibilite": 0.0,
+    "score_concurrence": 0.0,
+    "demande_trends": 0.0,
+    "marker_size": 7.0,
+    "marker_opacity": 0.9,
+    "marker_symbol": "x",
+    "label": df_clubs.get("nom", pd.Series(["Club padel"] * len(df_clubs))).fillna("Club padel"),
+})
+
+# CSV unique
+all_cols = [
+    "type_point", "code_departement", "code_commune_insee", "nom", "commune",
+    "latitude", "longitude", "score_final", "score_accessibilite", "score_concurrence", "demande_trends",
+    "marker_size", "marker_opacity", "marker_symbol", "label"
+]
+
+df_one = pd.concat([df_comm_out[all_cols], df_clubs_out[all_cols]], ignore_index=True)
+df_one.to_csv(out_csv, index=False)
+
+print(f"✅ CSV unique genere: {out_csv}")
+print(f" - Communes: {len(df_comm_out):,}")
+print(f" - Clubs: {len(df_clubs_out):,}")
+print(f" - Total points: {len(df_one):,}")
+--- CELL 38 ---
+# Carte interactive Plotly des clubs de padel (CSV unique) - version stable
+
+from pathlib import Path
+import math
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+
+CSV_FILENAME = "part-00000-fa44d60d-0c5b-428a-b1ed-a24b693f9e69-c000.csv"
+
+
+def resolve_csv_path(filename: str) -> Path:
+    candidates = []
+    local_expected = Path("data") / "dash_ready" / "dash_clubs.csv" / filename
+    if local_expected.exists():
+        return local_expected.resolve()
+
+    for root in [Path.cwd(), Path("/workspaces"), Path("/workspace"), Path("/")]:
+        if root.exists():
+            try:
+                candidates.append(next(root.rglob(filename)))
+            except StopIteration:
+                pass
+            except Exception:
+                pass
+        if candidates:
+            break
+
+    if not candidates:
+        raise FileNotFoundError(
+            f"Fichier introuvable: {filename}. "
+            "Place-le dans data/dash_ready/dash_clubs.csv/ ou adapte le chemin."
+        )
+    return candidates[0].resolve()
+
+
+DEPT_INFO = {
+    "01": ("Ain", "Auvergne-Rhone-Alpes"), "02": ("Aisne", "Hauts-de-France"),
+    "03": ("Allier", "Auvergne-Rhone-Alpes"), "04": ("Alpes-de-Haute-Provence", "Provence-Alpes-Cote d'Azur"),
+    "05": ("Hautes-Alpes", "Provence-Alpes-Cote d'Azur"), "06": ("Alpes-Maritimes", "Provence-Alpes-Cote d'Azur"),
+    "07": ("Ardeche", "Auvergne-Rhone-Alpes"), "08": ("Ardennes", "Grand Est"),
+    "09": ("Ariege", "Occitanie"), "10": ("Aube", "Grand Est"), "11": ("Aude", "Occitanie"),
+    "12": ("Aveyron", "Occitanie"), "13": ("Bouches-du-Rhone", "Provence-Alpes-Cote d'Azur"),
+    "14": ("Calvados", "Normandie"), "15": ("Cantal", "Auvergne-Rhone-Alpes"),
+    "16": ("Charente", "Nouvelle-Aquitaine"), "17": ("Charente-Maritime", "Nouvelle-Aquitaine"),
+    "18": ("Cher", "Centre-Val de Loire"), "19": ("Correze", "Nouvelle-Aquitaine"),
+    "21": ("Cote-d'Or", "Bourgogne-Franche-Comte"), "22": ("Cotes-d'Armor", "Bretagne"),
+    "23": ("Creuse", "Nouvelle-Aquitaine"), "24": ("Dordogne", "Nouvelle-Aquitaine"),
+    "25": ("Doubs", "Bourgogne-Franche-Comte"), "26": ("Drome", "Auvergne-Rhone-Alpes"),
+    "27": ("Eure", "Normandie"), "28": ("Eure-et-Loir", "Centre-Val de Loire"),
+    "29": ("Finistere", "Bretagne"), "2A": ("Corse-du-Sud", "Corse"), "2B": ("Haute-Corse", "Corse"),
+    "30": ("Gard", "Occitanie"), "31": ("Haute-Garonne", "Occitanie"), "32": ("Gers", "Occitanie"),
+    "33": ("Gironde", "Nouvelle-Aquitaine"), "34": ("Herault", "Occitanie"), "35": ("Ille-et-Vilaine", "Bretagne"),
+    "36": ("Indre", "Centre-Val de Loire"), "37": ("Indre-et-Loire", "Centre-Val de Loire"),
+    "38": ("Isere", "Auvergne-Rhone-Alpes"), "39": ("Jura", "Bourgogne-Franche-Comte"),
+    "40": ("Landes", "Nouvelle-Aquitaine"), "41": ("Loir-et-Cher", "Centre-Val de Loire"),
+    "42": ("Loire", "Auvergne-Rhone-Alpes"), "43": ("Haute-Loire", "Auvergne-Rhone-Alpes"),
+    "44": ("Loire-Atlantique", "Pays de la Loire"), "45": ("Loiret", "Centre-Val de Loire"),
+    "46": ("Lot", "Occitanie"), "47": ("Lot-et-Garonne", "Nouvelle-Aquitaine"),
+    "48": ("Lozere", "Occitanie"), "49": ("Maine-et-Loire", "Pays de la Loire"),
+    "50": ("Manche", "Normandie"), "51": ("Marne", "Grand Est"), "52": ("Haute-Marne", "Grand Est"),
+    "53": ("Mayenne", "Pays de la Loire"), "54": ("Meurthe-et-Moselle", "Grand Est"),
+    "55": ("Meuse", "Grand Est"), "56": ("Morbihan", "Bretagne"), "57": ("Moselle", "Grand Est"),
+    "58": ("Nievre", "Bourgogne-Franche-Comte"), "59": ("Nord", "Hauts-de-France"),
+    "60": ("Oise", "Hauts-de-France"), "61": ("Orne", "Normandie"), "62": ("Pas-de-Calais", "Hauts-de-France"),
+    "63": ("Puy-de-Dome", "Auvergne-Rhone-Alpes"), "64": ("Pyrenees-Atlantiques", "Nouvelle-Aquitaine"),
+    "65": ("Hautes-Pyrenees", "Occitanie"), "66": ("Pyrenees-Orientales", "Occitanie"),
+    "67": ("Bas-Rhin", "Grand Est"), "68": ("Haut-Rhin", "Grand Est"), "69": ("Rhone", "Auvergne-Rhone-Alpes"),
+    "70": ("Haute-Saone", "Bourgogne-Franche-Comte"), "71": ("Saone-et-Loire", "Bourgogne-Franche-Comte"),
+    "72": ("Sarthe", "Pays de la Loire"), "73": ("Savoie", "Auvergne-Rhone-Alpes"),
+    "74": ("Haute-Savoie", "Auvergne-Rhone-Alpes"), "75": ("Paris", "Ile-de-France"),
+    "76": ("Seine-Maritime", "Normandie"), "77": ("Seine-et-Marne", "Ile-de-France"),
+    "78": ("Yvelines", "Ile-de-France"), "79": ("Deux-Sevres", "Nouvelle-Aquitaine"),
+    "80": ("Somme", "Hauts-de-France"), "81": ("Tarn", "Occitanie"), "82": ("Tarn-et-Garonne", "Occitanie"),
+    "83": ("Var", "Provence-Alpes-Cote d'Azur"), "84": ("Vaucluse", "Provence-Alpes-Cote d'Azur"),
+    "85": ("Vendee", "Pays de la Loire"), "86": ("Vienne", "Nouvelle-Aquitaine"),
+    "87": ("Haute-Vienne", "Nouvelle-Aquitaine"), "88": ("Vosges", "Grand Est"),
+    "89": ("Yonne", "Bourgogne-Franche-Comte"), "90": ("Territoire de Belfort", "Bourgogne-Franche-Comte"),
+    "91": ("Essonne", "Ile-de-France"), "92": ("Hauts-de-Seine", "Ile-de-France"),
+    "93": ("Seine-Saint-Denis", "Ile-de-France"), "94": ("Val-de-Marne", "Ile-de-France"),
+    "95": ("Val-d'Oise", "Ile-de-France"),
+}
+
+REGION_ORDER = [
+    "Auvergne-Rhone-Alpes", "Bourgogne-Franche-Comte", "Bretagne", "Centre-Val de Loire", "Corse",
+    "Grand Est", "Hauts-de-France", "Ile-de-France", "Normandie", "Nouvelle-Aquitaine", "Occitanie",
+    "Pays de la Loire", "Provence-Alpes-Cote d'Azur", "Autres"
+]
+
+
+def _dept_meta(code):
+    code_s = str(code)
+    if code_s in DEPT_INFO:
+        return DEPT_INFO[code_s]
+    return f"Departement {code_s}", "Autres"
+
+
+def _zoom_from_bounds(lat_min, lat_max, lon_min, lon_max):
+    lat_span = max(0.12, float(lat_max - lat_min) * 1.18)
+    lon_span = max(0.12, float(lon_max - lon_min) * 1.18)
+    z_lon = math.log2(360.0 / lon_span)
+    z_lat = math.log2(170.0 / lat_span)
+    return max(3.0, min(12.0, min(z_lon, z_lat) - 0.25))
+
+
+CSV_PATH = resolve_csv_path(CSV_FILENAME)
+print(f"CSV utilise: {CSV_PATH}")
+
+clubs = pd.read_csv(CSV_PATH)
+required_cols = [
+    "nom", "type", "commune", "latitude", "longitude", "nombre_de_courts", "source", "source_principale",
+    "departement_code", "score_zone_implantation", "prix_median_m2_zone", "ind_snv_zone",
+    "indice_demande_trends_zone", "part_cible_padel_zone", "zone_saturee"
+]
+for c in required_cols:
+    if c not in clubs.columns:
+        clubs[c] = np.nan
+
+clubs["latitude"] = pd.to_numeric(clubs["latitude"], errors="coerce")
+clubs["longitude"] = pd.to_numeric(clubs["longitude"], errors="coerce")
+clubs["nombre_de_courts"] = pd.to_numeric(clubs["nombre_de_courts"], errors="coerce")
+clubs["score_zone_implantation"] = pd.to_numeric(clubs["score_zone_implantation"], errors="coerce")
+
+mask_padel = (
+    clubs["nom"].fillna("").str.contains("padel", case=False, na=False)
+    | clubs["type"].fillna("").str.contains("padel", case=False, na=False)
+)
+mask_metro = (
+    clubs["latitude"].between(41.0, 51.5, inclusive="both")
+    & clubs["longitude"].between(-5.5, 10.5, inclusive="both")
+)
+
+base = clubs.loc[mask_padel & mask_metro].copy()
+if base.empty:
+    raise ValueError("Aucun club padel en France metropolitaine avec ce CSV.")
+
+base["source_principale_bool"] = (
+    base["source_principale"]
+    .astype(str).str.strip().str.lower()
+    .map({"true": True, "false": False, "1": True, "0": False, "yes": True, "no": False})
+    .fillna(False)
+)
+base["source"] = base["source"].fillna("N/A").astype(str)
+base["type"] = base["type"].fillna("N/A").astype(str)
+
+all_deps = sorted(base["departement_code"].dropna().astype(str).unique().tolist())
+all_actors = sorted(base["source"].dropna().astype(str).unique().tolist())
+all_types = sorted(base["type"].dropna().astype(str).unique().tolist())
+
+region_to_options = {}
+for dep in all_deps:
+    dep_name, region_name = _dept_meta(dep)
+    region_to_options.setdefault(region_name, []).append((f"{dep_name} - {dep}", dep))
+for r in region_to_options:
+    region_to_options[r] = sorted(region_to_options[r], key=lambda x: x[0])
+ordered_regions = [r for r in REGION_ORDER if r in region_to_options] + sorted(
+    [r for r in region_to_options if r not in REGION_ORDER]
+)
+
+dept_selectors = {}
+children = []
+for region in ordered_regions:
+    w_region = widgets.SelectMultiple(
+        options=region_to_options[region], value=(), description="",
+        layout=widgets.Layout(width="350px", height="150px")
+    )
+    dept_selectors[region] = w_region
+    children.append(w_region)
+
+w_deps_by_region = widgets.Accordion(children=children, selected_index=0)
+for i, region in enumerate(ordered_regions):
+    w_deps_by_region.set_title(i, region)
+
+w_reset_deps = widgets.Button(description="Vue France (reset dep)", layout=widgets.Layout(width="220px"))
+
+score_min = float(np.nanmin(base["score_zone_implantation"]))
+score_max = float(np.nanmax(base["score_zone_implantation"]))
+global_min = float(base["score_zone_implantation"].min())
+global_max = float(base["score_zone_implantation"].max())
+if np.isfinite(global_min) and np.isfinite(global_max) and global_min == global_max:
+    eps = max(abs(global_min) * 0.01, 1e-6)
+    global_min -= eps
+    global_max += eps
+
+w_actors = widgets.SelectMultiple(
+    options=all_actors, value=(), description="Acteurs:", layout=widgets.Layout(width="270px", height="150px")
+)
+w_types = widgets.SelectMultiple(
+    options=all_types, value=(), description="Type:", layout=widgets.Layout(width="320px", height="150px")
+)
+w_score = widgets.FloatRangeSlider(
+    value=[score_min, score_max], min=score_min, max=score_max,
+    step=max((score_max - score_min) / 300.0, 0.0001), description="Score:",
+    continuous_update=False, readout_format=".3f", layout=widgets.Layout(width="500px")
+)
+w_source = widgets.Checkbox(value=False, description="Source principale uniquement")
+w_mode = widgets.ToggleButtons(
+    options=[("Global", "global"), ("Local", "local")], value="global", description="Mode couleur:"
+)
+visible_count = widgets.HTML()
+
+FRANCE_CENTER_LAT = 46.6
+FRANCE_CENTER_LON = 2.3
+FRANCE_ZOOM = 5.0
+view_state = {"center_lat": FRANCE_CENTER_LAT, "center_lon": FRANCE_CENTER_LON, "zoom": FRANCE_ZOOM}
+ui_state = {"suspend": False}
+
+map_out = widgets.Output(layout=widgets.Layout(width="100%", height="1050px"))
+
+
+def _selected_deps():
+    selected = []
+    for region in ordered_regions:
+        selected.extend(list(dept_selectors[region].value))
+    return set(selected)
+
+
+def _apply_filters():
+    df = base.copy()
+
+    sel_deps = _selected_deps()
+    if sel_deps:
+        df = df[df["departement_code"].astype(str).isin(sel_deps)]
+
+    sel_actors = set(w_actors.value)
+    if sel_actors:
+        df = df[df["source"].astype(str).isin(sel_actors)]
+
+    sel_types = set(w_types.value)
+    if sel_types:
+        df = df[df["type"].astype(str).isin(sel_types)]
+
+    smin, smax = w_score.value
+    df = df[df["score_zone_implantation"].between(smin, smax, inclusive="both")]
+
+    if w_source.value:
+        df = df[df["source_principale_bool"]]
+
+    return df
+
+
+def _compute_sizes(df):
+    courts = pd.to_numeric(df["nombre_de_courts"], errors="coerce")
+    sizes = np.where(courts.isna(), 7.0, 4.0 + courts.clip(lower=1) * 1.8)
+    return np.clip(sizes, 6.0, 28.0)
+
+
+def _get_color_range(df):
+    if w_mode.value == "global":
+        return global_min, global_max
+
+    cmin = float(df["score_zone_implantation"].min()) if not df.empty else global_min
+    cmax = float(df["score_zone_implantation"].max()) if not df.empty else global_max
+    if not np.isfinite(cmin) or not np.isfinite(cmax):
+        cmin, cmax = global_min, global_max
+    elif cmin == cmax:
+        eps = max(abs(cmin) * 0.01, 1e-6)
+        cmin -= eps
+        cmax += eps
+    return cmin, cmax
+
+
+def _auto_zoom_to_df(df):
+    if df.empty:
+        return
+    lat_min = float(df["latitude"].min())
+    lat_max = float(df["latitude"].max())
+    lon_min = float(df["longitude"].min())
+    lon_max = float(df["longitude"].max())
+    view_state["center_lat"] = (lat_min + lat_max) / 2.0
+    view_state["center_lon"] = (lon_min + lon_max) / 2.0
+    view_state["zoom"] = _zoom_from_bounds(lat_min, lat_max, lon_min, lon_max)
+
+
+def _set_view_france():
+    view_state["center_lat"] = FRANCE_CENTER_LAT
+    view_state["center_lon"] = FRANCE_CENTER_LON
+    view_state["zoom"] = FRANCE_ZOOM
+
+
+def _draw_map(df):
+    cmin, cmax = _get_color_range(df)
+    fig = go.Figure()
+
+    if not df.empty:
+        sizes = _compute_sizes(df)
+        custom = np.stack([
+            df["nom"].fillna("N/A").astype(str),
+            df["commune"].fillna("N/A").astype(str),
+            df["departement_code"].fillna("N/A").astype(str),
+            df["source"].fillna("N/A").astype(str),
+            df["type"].fillna("N/A").astype(str),
+            df["score_zone_implantation"].fillna(np.nan),
+            df["prix_median_m2_zone"].fillna(np.nan),
+            df["ind_snv_zone"].fillna(np.nan),
+            df["indice_demande_trends_zone"].fillna(np.nan),
+            df["part_cible_padel_zone"].fillna(np.nan),
+            df["zone_saturee"].fillna("N/A").astype(str),
+        ], axis=-1)
+
+        fig.add_trace(go.Scattermap(
+            lat=df["latitude"], lon=df["longitude"], mode="markers", hoverinfo="skip",
+            marker=dict(size=(np.array(sizes) + 1.2).tolist(), color="rgba(20,20,20,0.55)", opacity=0.8),
+            showlegend=False,
+        ))
+
+        fig.add_trace(go.Scattermap(
+            lat=df["latitude"], lon=df["longitude"], mode="markers", customdata=custom,
+            hovertemplate=(
+                "<b>%{customdata[0]}</b><br>"
+                "Commune: %{customdata[1]}<br>"
+                "Departement: %{customdata[2]}<br>"
+                "Acteur: %{customdata[3]}<br>"
+                "Type: %{customdata[4]}<br>"
+                "Score implantation: %{customdata[5]:.3f}<br>"
+                "Prix median m2: %{customdata[6]:.0f}<br>"
+                "ind_snv_zone: %{customdata[7]:.0f}<br>"
+                "indice_demande_trends_zone: %{customdata[8]:.1f}<br>"
+                "part_cible_padel_zone: %{customdata[9]:.3f}<br>"
+                "zone_saturee: %{customdata[10]}"
+                "<extra></extra>"
+            ),
+            marker=dict(
+                size=np.array(sizes).tolist(), color=df["score_zone_implantation"].to_list(),
+                colorscale="Viridis", cmin=cmin, cmax=cmax, opacity=0.8,
+                colorbar=dict(title="Couleur: Score d'implantation")
+            ),
+            showlegend=False,
+        ))
+
+    fig.update_layout(
+        title=f"Clubs de Padel en France ({len(df)} clubs visibles)",
+        template="plotly_white",
+        height=1000,
+        margin=dict(l=0, r=0, t=70, b=0),
+        map=dict(
+            style="open-street-map",
+            center=dict(lat=view_state["center_lat"], lon=view_state["center_lon"]),
+            zoom=view_state["zoom"],
+        ),
+    )
+
+    with map_out:
+        clear_output(wait=True)
+        display(fig)
+
+
+def _render(*_):
+    if ui_state["suspend"]:
+        return
+    df = _apply_filters()
+    visible_count.value = f"<b>{len(df)} clubs visibles</b>"
+    _draw_map(df)
+
+
+def _on_deps_change(_change=None):
+    if ui_state["suspend"]:
+        return
+
+    selected = _selected_deps()
+    if selected:
+        if w_mode.value != "local":
+            w_mode.value = "local"
+        _auto_zoom_to_df(_apply_filters())
+    else:
+        w_mode.value = "global"
+        _set_view_france()
+    _render()
+
+
+def _on_reset(_btn):
+    ui_state["suspend"] = True
+    try:
+        for region in ordered_regions:
+            dept_selectors[region].value = ()
+    finally:
+        ui_state["suspend"] = False
+    w_mode.value = "global"
+    _set_view_france()
+    _render()
+
+
+for region in ordered_regions:
+    dept_selectors[region].observe(_on_deps_change, names="value")
+w_reset_deps.on_click(_on_reset)
+for w in [w_actors, w_types, w_score, w_source, w_mode]:
+    w.observe(_render, names="value")
+
+controls = widgets.VBox([
+    widgets.HBox([widgets.VBox([w_deps_by_region, w_reset_deps]), w_actors, w_types]),
+    widgets.HBox([w_score, w_source, w_mode, visible_count]),
+])
+
+display(controls, map_out)
+_render()
+
+--- CELL 39 ---
+# Reagencement UI: departements a gauche, carte a droite, autres filtres en bas
+
+import ipywidgets as widgets
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from IPython.display import display, clear_output
+
+required = [
+    "base", "map_out", "_compute_sizes", "_get_color_range", "view_state", "ui_state", "_auto_zoom_to_df", "_set_view_france"
+]
+missing = [name for name in required if name not in globals()]
+if missing:
+    raise RuntimeError("Execute d'abord la cellule carte, variables manquantes: " + ", ".join(missing))
+
+# ---------- Departements par regions avec cases a cocher ----------
+def _local_dept_meta(code):
+    code_s = str(code)
+    if "DEPT_INFO" in globals() and code_s in DEPT_INFO:
+        name, region = DEPT_INFO[code_s]
+        return name, region
+    return f"Departement {code_s}", "Autres"
+
+all_deps = sorted(base["departement_code"].dropna().astype(str).unique().tolist())
+region_to_deps = {}
+for dep in all_deps:
+    name, region = _local_dept_meta(dep)
+    region_to_deps.setdefault(region, []).append((dep, f"{name} - {dep}"))
+for r in region_to_deps:
+    region_to_deps[r] = sorted(region_to_deps[r], key=lambda x: x[1])
+
+if "REGION_ORDER" in globals():
+    ordered_regions = [r for r in REGION_ORDER if r in region_to_deps]
+    ordered_regions += sorted([r for r in region_to_deps if r not in ordered_regions])
+else:
+    ordered_regions = sorted(region_to_deps.keys())
+
+dep_checkboxes = {}
+accordion_children = []
+for region in ordered_regions:
+    region_boxes = []
+    for dep_code, dep_label in region_to_deps[region]:
+        cb = widgets.Checkbox(value=False, description=dep_label, indent=False)
+        cb.layout = widgets.Layout(width="100%")
+        dep_checkboxes[dep_code] = cb
+        region_boxes.append(cb)
+
+    region_panel = widgets.VBox(
+        region_boxes,
+        layout=widgets.Layout(height="170px", overflow_y="auto", overflow_x="hidden", padding="4px 6px")
+    )
+    accordion_children.append(region_panel)
+
+w_deps_by_region = widgets.Accordion(children=accordion_children, selected_index=0, layout=widgets.Layout(width="100%"))
+for i, region in enumerate(ordered_regions):
+    w_deps_by_region.set_title(i, region)
+
+w_reset_deps = widgets.Button(
+    description="Vue France (reset dep)",
+    icon="refresh",
+    layout=widgets.Layout(width="100%")
+)
+
+# CSS: supprime le scroll horizontal et force le retour a la ligne sur les labels longs
+w_dept_css = widgets.HTML("""
+<style>
+.jp-OutputArea .widget-accordion .widget-box {
+  overflow-x: hidden !important;
+}
+.jp-OutputArea .widget-accordion .widget-inline-hbox label {
+  white-space: normal !important;
+  word-break: break-word !important;
+}
+</style>
+""")
+
+# Marqueur visuel pour confirmer la MAJ de la cellule
+w_ui_stamp = widgets.HTML("<div style='font-size:12px; color:#4b5563; margin-bottom:2px;'>Mise a jour UI activee</div>")
+
+
+def _selected_deps():
+    return {code for code, cb in dep_checkboxes.items() if cb.value}
+
+
+# ---------- Autres filtres ----------
+price_series = pd.to_numeric(base["prix_median_m2_zone"], errors="coerce")
+price_min = float(np.nanmin(price_series)) if np.isfinite(np.nanmin(price_series)) else 0.0
+price_max = float(np.nanmax(price_series)) if np.isfinite(np.nanmax(price_series)) else 1000.0
+if price_min == price_max:
+    price_max = price_min + 1.0
+
+trends_series = pd.to_numeric(base["indice_demande_trends_zone"], errors="coerce")
+trends_min = float(np.nanmin(trends_series)) if np.isfinite(np.nanmin(trends_series)) else 0.0
+trends_max = float(np.nanmax(trends_series)) if np.isfinite(np.nanmax(trends_series)) else 100.0
+if trends_min == trends_max:
+    trends_max = trends_min + 1.0
+
+score_series = pd.to_numeric(base["score_zone_implantation"], errors="coerce")
+score_min = float(np.nanmin(score_series))
+score_max = float(np.nanmax(score_series))
+
+w_type = widgets.Dropdown(
+    options=[
+        ("Tout", "all"),
+        ("Club de padel", "club_padel"),
+        ("Club de tennis/padel", "club_tennis_padel"),
+        ("Piste de padel", "piste_padel"),
+    ],
+    value="all",
+    description="Type:",
+    layout=widgets.Layout(width="100%")
+)
+
+w_score = widgets.FloatRangeSlider(
+    value=[score_min, score_max],
+    min=score_min,
+    max=score_max,
+    step=max((score_max - score_min) / 300.0, 0.0001),
+    description="Score:",
+    continuous_update=False,
+    readout_format=".3f",
+    layout=widgets.Layout(width="100%")
+)
+
+w_mode = widgets.ToggleButtons(
+    options=[("Global", "global"), ("Local", "local")],
+    value="global",
+    description="Mode:"
+)
+
+w_commune = widgets.Text(
+    value="",
+    description="Commune:",
+    placeholder="ex: Paris, Lyon...",
+    layout=widgets.Layout(width="100%")
+)
+
+w_zone_saturee = widgets.Dropdown(
+    options=[("Toutes", "all"), ("Saturee", "true"), ("Non saturee", "false")],
+    value="all",
+    description="Zone:",
+    layout=widgets.Layout(width="100%")
+)
+
+w_price = widgets.FloatRangeSlider(
+    value=[price_min, price_max],
+    min=price_min,
+    max=price_max,
+    step=max((price_max - price_min) / 300.0, 0.1),
+    description="Prix m2:",
+    continuous_update=False,
+    readout_format=".1f",
+    layout=widgets.Layout(width="100%")
+)
+
+w_trends = widgets.FloatRangeSlider(
+    value=[trends_min, trends_max],
+    min=trends_min,
+    max=trends_max,
+    step=max((trends_max - trends_min) / 300.0, 0.1),
+    description="Trends:",
+    continuous_update=False,
+    readout_format=".1f",
+    layout=widgets.Layout(width="100%")
+)
+
+visible_count = widgets.HTML(
+    value="<div style='text-align:center; font-weight:700; font-size:14px; margin-top:4px;'>0 club visible</div>"
+)
+
+
+def _type_mask(df, selected_type):
+    txt_type = df["type"].fillna("").str.lower()
+    txt_nom = df["nom"].fillna("").str.lower()
+
+    if selected_type == "all":
+        return pd.Series([True] * len(df), index=df.index)
+    if selected_type == "club_tennis_padel":
+        return (txt_type.str.contains("tennis") & txt_type.str.contains("padel")) | (
+            txt_nom.str.contains("tennis") & txt_nom.str.contains("padel")
+        )
+    if selected_type == "piste_padel":
+        return (txt_type.str.contains("piste") & txt_type.str.contains("padel")) | (
+            txt_nom.str.contains("piste") & txt_nom.str.contains("padel")
+        )
+    # club_padel
+    return (
+        (txt_type.str.contains("club") & txt_type.str.contains("padel") & ~txt_type.str.contains("tennis"))
+        | (txt_nom.str.contains("club") & txt_nom.str.contains("padel") & ~txt_nom.str.contains("tennis"))
+    )
+
+
+def _apply_filters():
+    df = base.copy()
+
+    sel_deps = _selected_deps()
+    if sel_deps:
+        df = df[df["departement_code"].astype(str).isin(sel_deps)]
+
+    df = df[_type_mask(df, w_type.value)]
+
+    smin, smax = w_score.value
+    df = df[df["score_zone_implantation"].between(smin, smax, inclusive="both")]
+
+    commune_q = w_commune.value.strip().lower()
+    if commune_q:
+        df = df[df["commune"].fillna("").str.lower().str.contains(commune_q, na=False)]
+
+    zone_mode = w_zone_saturee.value
+    if zone_mode != "all":
+        zs = df["zone_saturee"].astype(str).str.strip().str.lower()
+        if zone_mode == "true":
+            df = df[zs.isin(["true", "1", "yes", "oui"])]
+        else:
+            df = df[zs.isin(["false", "0", "no", "non"])]
+
+    pmin, pmax = w_price.value
+    prices = pd.to_numeric(df["prix_median_m2_zone"], errors="coerce")
+    df = df[prices.between(pmin, pmax, inclusive="both") | prices.isna()]
+
+    tmin, tmax = w_trends.value
+    trends = pd.to_numeric(df["indice_demande_trends_zone"], errors="coerce")
+    df = df[trends.between(tmin, tmax, inclusive="both") | trends.isna()]
+
+    return df
+
+
+def _draw_map(df):
+    cmin, cmax = _get_color_range(df)
+    fig = go.Figure()
+
+    if not df.empty:
+        sizes = _compute_sizes(df)
+        custom = np.stack([
+            df["nom"].fillna("N/A").astype(str),
+            df["commune"].fillna("N/A").astype(str),
+            df["departement_code"].fillna("N/A").astype(str),
+            df["source"].fillna("N/A").astype(str),
+            df["type"].fillna("N/A").astype(str),
+            df["score_zone_implantation"].fillna(np.nan),
+            df["prix_median_m2_zone"].fillna(np.nan),
+            df["ind_snv_zone"].fillna(np.nan),
+            df["indice_demande_trends_zone"].fillna(np.nan),
+            df["part_cible_padel_zone"].fillna(np.nan),
+            df["zone_saturee"].fillna("N/A").astype(str),
+        ], axis=-1)
+
+        fig.add_trace(go.Scattermap(
+            lat=df["latitude"], lon=df["longitude"], mode="markers", hoverinfo="skip",
+            marker=dict(size=(np.array(sizes) + 1.2).tolist(), color="rgba(20,20,20,0.55)", opacity=0.8),
+            showlegend=False,
+        ))
+
+        fig.add_trace(go.Scattermap(
+            lat=df["latitude"], lon=df["longitude"], mode="markers", customdata=custom,
+            hovertemplate=(
+                "<b>%{customdata[0]}</b><br>"
+                "Commune: %{customdata[1]}<br>"
+                "Departement: %{customdata[2]}<br>"
+                "Acteur: %{customdata[3]}<br>"
+                "Type: %{customdata[4]}<br>"
+                "Score implantation: %{customdata[5]:.3f}<br>"
+                "Prix median m2: %{customdata[6]:.0f}<br>"
+                "ind_snv_zone: %{customdata[7]:.0f}<br>"
+                "indice_demande_trends_zone: %{customdata[8]:.1f}<br>"
+                "part_cible_padel_zone: %{customdata[9]:.3f}<br>"
+                "zone_saturee: %{customdata[10]}"
+                "<extra></extra>"
+            ),
+            marker=dict(
+                size=np.array(sizes).tolist(),
+                color=df["score_zone_implantation"].to_list(),
+                colorscale="Viridis",
+                cmin=cmin,
+                cmax=cmax,
+                opacity=0.8,
+                colorbar=dict(title="Score", thickness=9, len=0.56, x=0.985, xanchor="left", outlinewidth=0),
+            ),
+            showlegend=False,
+        ))
+
+    fig.update_layout(
+        title=f"Clubs de Padel en France ({len(df)} clubs visibles)",
+        template="plotly_white",
+        height=820,
+        margin=dict(l=0, r=0, t=60, b=0),
+        map=dict(
+            style="open-street-map",
+            center=dict(lat=view_state["center_lat"], lon=view_state["center_lon"]),
+            zoom=view_state["zoom"],
+        ),
+    )
+
+    with map_out:
+        clear_output(wait=True)
+        display(fig)
+
+
+def _render(*_):
+    if ui_state["suspend"]:
+        return
+    df = _apply_filters()
+    suffix = "club visible" if len(df) == 1 else "clubs visibles"
+    visible_count.value = f"<div style='text-align:center; font-weight:700; font-size:14px; margin-top:4px;'>{len(df)} {suffix}</div>"
+    _draw_map(df)
+
+
+def _on_deps_change(_change=None):
+    if ui_state["suspend"]:
+        return
+    selected = _selected_deps()
+    if selected:
+        if w_mode.value != "local":
+            w_mode.value = "local"
+        _auto_zoom_to_df(_apply_filters())
+    else:
+        w_mode.value = "global"
+        _set_view_france()
+    _render()
+
+
+def _on_reset(_btn):
+    ui_state["suspend"] = True
+    try:
+        for cb in dep_checkboxes.values():
+            cb.value = False
+    finally:
+        ui_state["suspend"] = False
+    w_mode.value = "global"
+    _set_view_france()
+    _render()
+
+
+# ---------- Layout harmonise ----------
+map_out.layout = widgets.Layout(height="840px", min_width="770px", flex="1 1 0%", width="1px")
+
+left_panel = widgets.VBox(
+    [w_dept_css, w_ui_stamp, widgets.HTML("<b>Departements (multi-selection)</b>"), w_deps_by_region, w_reset_deps],
+    layout=widgets.Layout(
+        width="360px",
+        min_width="360px",
+        flex="0 0 360px",
+        border="1px solid #dfe3e8",
+        padding="12px",
+        border_radius="10px",
+        gap="10px",
+        overflow_x="hidden"
+    )
+)
+
+map_panel = widgets.VBox(
+    [map_out],
+    layout=widgets.Layout(flex="1 1 auto", width="auto", min_width="770px")
+)
+
+top_row = widgets.HBox(
+    [left_panel, map_panel],
+    layout=widgets.Layout(width="100%", align_items="flex-start", gap="12px")
+)
+
+card_layout = widgets.Layout(
+    border="1px solid #dfe3e8",
+    padding="12px",
+    border_radius="10px",
+    width="calc(25% - 9px)",
+    min_width="270px",
+    gap="8px"
+)
+
+score_card = widgets.VBox(
+    [
+        widgets.HTML("<b>Score d'implantation</b>"),
+        w_score,
+        widgets.HBox([w_mode], layout=widgets.Layout(justify_content="center")),
+        visible_count,
+    ],
+    layout=card_layout
+)
+
+card_primary = widgets.VBox(
+    [widgets.HTML("<b>Type</b>"), w_type],
+    layout=card_layout
+)
+
+card_geo = widgets.VBox(
+    [widgets.HTML("<b>Filtres geographiques</b>"), w_commune, w_zone_saturee],
+    layout=card_layout
+)
+
+card_market = widgets.VBox(
+    [widgets.HTML("<b>Filtres marche</b>"), w_price, w_trends],
+    layout=card_layout
+)
+
+bottom_row = widgets.HBox(
+    [card_primary, score_card, card_geo, card_market],
+    layout=widgets.Layout(width="100%", align_items="stretch", gap="12px", flex_wrap="wrap")
+)
+
+ui_final = widgets.VBox(
+    [top_row, bottom_row],
+    layout=widgets.Layout(width="100%", gap="12px")
+)
+
+clear_output(wait=True)
+display(ui_final)
+
+# Events
+w_reset_deps.on_click(_on_reset)
+for cb in dep_checkboxes.values():
+    cb.observe(_on_deps_change, names="value")
+for w in [w_type, w_score, w_mode, w_commune, w_zone_saturee, w_price, w_trends]:
+    w.observe(_render, names="value")
+
+_render()
+--- CELL 40 ---
+%pip install plotly ipywidgets pandas numpy anywidget -q

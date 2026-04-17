@@ -9,4 +9,4 @@ services:
       - .:/home/jovyan/work
     environment:
       - JUPYTER_TOKEN=padel
-    mem_limit: 8g
+    mem_limit: 12g

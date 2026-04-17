@@ -1,0 +1,1 @@
+%pip install plotly ipywidgets pandas numpy anywidget -q
