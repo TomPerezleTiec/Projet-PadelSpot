@@ -1,0 +1,383 @@
+
+=== CELL 87 ===
+# ============================================================
+
+def _first_existing_path(candidates: list[str]) -> "str | None":
+    """Retourne le premier chemin existant dans la liste, ou None.
+
+    Args:
+        candidates: Liste de chemins à tester dans l'ordre.
+
+    Returns:
+        Premier chemin existant, ou None si aucun ne l'est.
+    """
+    import os
+    return next((p for p in candidates if os.path.exists(p)), None)
+
+
+def _bytes_to_mb(value: float) -> float:
+    """Convertit des octets en mégaoctets arrondis à 2 décimales.
+
+    Args:
+        value: Taille en octets.
+
+    Returns:
+        Taille en Mo (float, 2 décimales).
+    """
+    return round(float(value) / (1024.0 * 1024.0), 2)
+
+
+def _path_size_bytes(path: str) -> int:
+    """Calcule la taille totale d'un fichier ou d'un répertoire en octets.
+
+    Args:
+        path: Chemin vers un fichier ou un répertoire.
+
+    Returns:
+        Taille totale en octets (0 si le chemin n'existe pas).
+    """
+    import os
+    if not os.path.exists(path):
+        return 0
+    if os.path.isfile(path):
+        return os.path.getsize(path)
+    total = 0
+    for root, _, files in os.walk(path):
+        for fname in files:
+            fp = os.path.join(root, fname)
+
+
+=== CELL 89 ===
+"""
+ETAPE 7 - CELLULE 1/3
+Preparation de la table principale dash_carreaux_full (grain carreau INSEE) via jointures Spark.
+- Lecture des sources avec schemas explicites pour les CSV.
+- Jointures lourdes uniquement dans Spark.
+- Optimisation des types (float32/int16) pour reduire le volume disque.
+- Export Parquet partitionne par code_departement + verification de comptage.
+"""
+
+import os
+from pyspark.sql import SparkSession, Window
+import pyspark.sql.functions as F
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType, LongType, FloatType, ShortType, IntegerType
+
+PATHS = {
+    "accessibilite_clean": "/home/jovyan/work/data/output/accessibilite_clean/",
+    "filosofi_clean": "/home/jovyan/work/data/output/filosofi_clean/",
+    "dvf_clean": "/home/jovyan/work/data/output/dvf_clean/",
+    "concurrence_padel": "/home/jovyan/work/data/output/clubs_concurrents/concurrence_padel/",
+    "clubs_concurrents": "/home/jovyan/work/data/output/clubs_concurrents/",
+    "trends_joined": "/home/jovyan/work/data/output/trends_joined/",
+    "score_final": "/home/jovyan/work/data/output/score_final/",
+    "score_final_full": "/home/jovyan/work/data/output/score_final_full/",
+    "osm_transport": "/home/jovyan/work/data/output/osm_transport_stops.csv",
+    "osm_roads": "/home/jovyan/work/data/output/osm_road_axes.csv",
+    "top_zones_geojson": "/home/jovyan/work/data/output/top_zones.geojson",
+}
+OUTPUT_DASH = "/home/jovyan/work/data/dash_ready/"
+os.makedirs(OUTPUT_DASH, exist_ok=True)
+
+# Spark session dediee ETAPE 7
+spark = SparkSession.builder \
+    .appName("PadelSpot_Step7_DashReady") \
+    .master("local[*]") \
+    .config("spark.driver.memory", "6g") \
+    .config("spark.sql.execution.arrow.pyspark.enabled", "true") \
+    .getOrCreate()
+spark.sparkContext.setLogLevel("WARN")
+
+# Helpers
+
+def _first_existing_path(candidates):
+    return next((p for p in candidates if os.path.exists(p)), None)
+
+
+
+
+=== CELL 91 ===
+"""
+ETAPE 7 - CELLULE 2/3
+Construction des tables derivees Dash-ready:
+- dash_communes_agg
+- dash_top_zones (parquet + geojson)
+- dash_clubs (parquet + csv)
+- dash_transport
+- dash_roads
+- dash_departements_stats (parquet + csv)
+"""
+
+import os
+import json
+import geopandas as gpd
+import pandas as pd
+from pyspark.sql import Window
+import pyspark.sql.functions as F
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType, LongType, IntegerType, BooleanType
+
+path_dash_carreaux_full = os.path.join(OUTPUT_DASH, "dash_carreaux_full")
+df_dash_carreaux_full = spark.read.parquet(path_dash_carreaux_full)
+
+# ============================================================
+# [2/7] dash_communes_agg
+# ============================================================
+path_dash_communes_agg = os.path.join(OUTPUT_DASH, "dash_communes_agg")
+
+df_dash_communes_agg = df_dash_carreaux_full.groupBy("code_commune_insee").agg(
+    F.first("code_departement", ignorenulls=True).alias("code_departement"),
+    F.count("*").alias("nb_carreaux"),
+    F.avg("score_final").alias("score_final_moyen"),
+    F.max("score_final").alias("score_final_max"),
+    F.avg("score_concurrence").alias("score_concurrence_moyen"),
+    F.avg("score_accessibilite").alias("score_accessibilite_moyen"),
+    F.avg("score_immobilier").alias("score_immobilier_moyen"),
+    F.avg("score_revenu").alias("score_revenu_moyen"),
+    F.avg("part_cible_padel").alias("part_cible_padel_moyen"),
+    F.avg("indice_demande_trends").alias("indice_demande_trends_moyen"),
+    F.avg("stabilite_score").alias("stabilite_score_moyen"),
+    F.avg("latitude").alias("lat_centre"),
+    F.avg("longitude").alias("lon_centre")
+)
+
+# Remplacement des boucles withColumn par un unique fillna (optimisation)
+col_zeros = [
+
+
+=== CELL 93 ===
+"""
+ETAPE 7 - CELLULE 3/3
+Generation de dash_metadata.json :
+- Volumes globaux, stats de score, tops departements/communes.
+- Taille des datasets produits.
+- Recapitulatif final imprime.
+"""
+
+import os
+import json
+from datetime import datetime, timezone
+import pyspark.sql.functions as F
+
+# Paths des tables produites
+path_dash_carreaux_full = os.path.join(OUTPUT_DASH, "dash_carreaux_full")
+path_dash_communes_agg = os.path.join(OUTPUT_DASH, "dash_communes_agg")
+path_dash_top_zones_parquet = os.path.join(OUTPUT_DASH, "dash_top_zones.parquet")
+path_dash_clubs_parquet = os.path.join(OUTPUT_DASH, "dash_clubs.parquet")
+path_dash_transport = os.path.join(OUTPUT_DASH, "dash_transport.parquet")
+path_dash_roads = os.path.join(OUTPUT_DASH, "dash_roads.parquet")
+path_dash_deps_parquet = os.path.join(OUTPUT_DASH, "dash_departements_stats.parquet")
+path_dash_metadata = os.path.join(OUTPUT_DASH, "dash_metadata.json")
+
+# Lecture tables
+df_carreaux = spark.read.parquet(path_dash_carreaux_full)
+df_communes = spark.read.parquet(path_dash_communes_agg)
+df_top_zones = spark.read.parquet(path_dash_top_zones_parquet)
+df_clubs = spark.read.parquet(path_dash_clubs_parquet)
+df_deps = spark.read.parquet(path_dash_deps_parquet)
+
+# Helper taille
+
+def _path_size_bytes(path):
+    if not os.path.exists(path):
+        return 0
+    if os.path.isfile(path):
+        return os.path.getsize(path)
+    total = 0
+    for root, _, files in os.walk(path):
+        for fn in files:
+            fp = os.path.join(root, fn)
+            if os.path.isfile(fp):
+                total += os.path.getsize(fp)
+    return total
+
+
+
+=== CELL 96 ===
+# Carte interactive Plotly des clubs de padel (CSV unique) - version stable
+
+from pathlib import Path
+import math
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+
+def resolve_csv_path() -> Path:
+    """Trouve le premier fichier part-*.csv dans dash_clubs.csv/ quel que soit l'UUID Spark."""
+    search_roots = [
+        Path("/home/jovyan/work"),
+        Path.cwd(),
+        Path("/workspaces"),
+        Path("/workspace"),
+    ]
+    for root in search_roots:
+        if not root.exists():
+            continue
+        # Cherche le dossier dash_clubs.csv (sortie coalesce Spark)
+        for candidate_dir in root.rglob("dash_clubs.csv"):
+            if candidate_dir.is_dir():
+                parts = sorted(candidate_dir.glob("part-*.csv"))
+                if parts:
+                    return parts[0].resolve()
+        # Fallback : fichier CSV plat nommé dash_clubs.csv
+        for candidate_file in root.rglob("dash_clubs.csv"):
+            if candidate_file.is_file():
+                return candidate_file.resolve()
+    raise FileNotFoundError(
+        "Aucun fichier dash_clubs.csv trouve. "
+        "Verifie que l'etape 7 (ecriture dash_clubs.csv) s'est bien executee."
+    )
+CSV_PATH = resolve_csv_path()
+print(f"CSV utilise: {CSV_PATH}")
+
+
+DEPT_INFO = {
+    "01": ("Ain", "Auvergne-Rhone-Alpes"), "02": ("Aisne", "Hauts-de-France"),
+    "03": ("Allier", "Auvergne-Rhone-Alpes"), "04": ("Alpes-de-Haute-Provence", "Provence-Alpes-Cote d'Azur"),
+    "05": ("Hautes-Alpes", "Provence-Alpes-Cote d'Azur"), "06": ("Alpes-Maritimes", "Provence-Alpes-Cote d'Azur"),
+    "07": ("Ardeche", "Auvergne-Rhone-Alpes"), "08": ("Ardennes", "Grand Est"),
+    "09": ("Ariege", "Occitanie"), "10": ("Aube", "Grand Est"), "11": ("Aude", "Occitanie"),
+
+
+=== CELL 98 ===
+# Reagencement UI: departements a gauche, carte a droite, autres filtres en bas
+
+import ipywidgets as widgets
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from IPython.display import display, clear_output
+
+required = [
+    "base", "map_out", "_compute_sizes", "_get_color_range", "view_state", "ui_state", "_auto_zoom_to_df", "_set_view_france"
+]
+missing = [name for name in required if name not in globals()]
+if missing:
+    raise RuntimeError("Execute d'abord la cellule carte, variables manquantes: " + ", ".join(missing))
+
+# ---------- Departements par regions avec cases a cocher ----------
+def _local_dept_meta(code):
+    code_s = str(code)
+    if "DEPT_INFO" in globals() and code_s in DEPT_INFO:
+        name, region = DEPT_INFO[code_s]
+        return name, region
+    return f"Departement {code_s}", "Autres"
+
+all_deps = sorted(base["departement_code"].dropna().astype(str).unique().tolist())
+region_to_deps = {}
+for dep in all_deps:
+    name, region = _local_dept_meta(dep)
+    region_to_deps.setdefault(region, []).append((dep, f"{name} - {dep}"))
+for r in region_to_deps:
+    region_to_deps[r] = sorted(region_to_deps[r], key=lambda x: x[1])
+
+if "REGION_ORDER" in globals():
+    ordered_regions = [r for r in REGION_ORDER if r in region_to_deps]
+    ordered_regions += sorted([r for r in region_to_deps if r not in ordered_regions])
+else:
+    ordered_regions = sorted(region_to_deps.keys())
+
+dep_checkboxes = {}
+accordion_children = []
+for region in ordered_regions:
+    region_boxes = []
+    for dep_code, dep_label in region_to_deps[region]:
+        cb = widgets.Checkbox(value=False, description=dep_label, indent=False)
+        cb.layout = widgets.Layout(width="100%")
+        dep_checkboxes[dep_code] = cb
+
+
+=== CELL 100 ===
+"""
+ETAPE 8 - Bundle Plotly (1 fichier ZIP + quelques fichiers pivots)
+Objectif: reduire la fragmentation des sorties pour un usage Plotly simple.
+Sorties:
+- plotly_bundle/plotly_master_communes.csv
+- plotly_bundle/plotly_top_zones.csv
+- plotly_bundle/plotly_departements.csv
+- plotly_bundle/plotly_top_zones.geojson
+- plotly_bundle/plotly_bundle.zip
+"""
+
+import os
+import zipfile
+import geopandas as gpd
+import pyspark.sql.functions as F
+
+# Dossiers de travail
+plotly_bundle_dir = os.path.join(OUTPUT_DASH, "plotly_bundle")
+os.makedirs(plotly_bundle_dir, exist_ok=True)
+
+# Sources dash_ready
+path_dash_communes_agg = os.path.join(OUTPUT_DASH, "dash_communes_agg")
+path_dash_top_zones_parquet = os.path.join(OUTPUT_DASH, "dash_top_zones.parquet")
+path_dash_top_zones_geojson = os.path.join(OUTPUT_DASH, "dash_top_zones.geojson")
+path_dash_deps_parquet = os.path.join(OUTPUT_DASH, "dash_departements_stats.parquet")
+
+# Cibles consolidees
+path_plotly_master_csv = os.path.join(plotly_bundle_dir, "plotly_master_communes.csv")
+path_plotly_top_csv = os.path.join(plotly_bundle_dir, "plotly_top_zones.csv")
+path_plotly_deps_csv = os.path.join(plotly_bundle_dir, "plotly_departements.csv")
+path_plotly_geojson = os.path.join(plotly_bundle_dir, "plotly_top_zones.geojson")
+path_plotly_readme = os.path.join(plotly_bundle_dir, "README_plotly_bundle.txt")
+path_plotly_zip = os.path.join(plotly_bundle_dir, "plotly_bundle.zip")
+
+# Lecture des tables finales
+# 1) communes agg (table maitre pour charts/carte)
+df_communes = spark.read.parquet(path_dash_communes_agg)
+
+# 2) stats departement
+if os.path.exists(path_dash_deps_parquet):
+    df_deps = spark.read.parquet(path_dash_deps_parquet).select(
+        "code_departement",
+        "opportunite_label",
+        "score_final_p90",
+        F.col("score_final_max").alias("dep_score_final_max"),
+
+
+=== CELL 102 ===
+"""
+ETAPE 9 - Fix carte Plotly
+- Genere un CSV communes lisible (markers limites)
+- Genere un CSV clubs pour afficher les points padel
+- Met a jour le ZIP du bundle
+"""
+
+import os
+import zipfile
+import pandas as pd
+
+bundle_dir = "/home/jovyan/work/data/dash_ready/plotly_bundle"
+unified_csv = f"{bundle_dir}/plotly_unified.csv"
+clubs_csv_src = "/home/jovyan/work/data/dash_ready/dash_clubs.csv/part-00000-fa44d60d-0c5b-428a-b1ed-a24b693f9e69-c000.csv"
+
+plotly_map_communes = f"{bundle_dir}/plotly_map_communes.csv"
+plotly_map_clubs = f"{bundle_dir}/plotly_map_clubs.csv"
+plotly_zip = f"{bundle_dir}/plotly_bundle.zip"
+
+# 1) Communes map-ready
+if not os.path.exists(unified_csv):
+    raise FileNotFoundError(f"Fichier introuvable: {unified_csv}")
+
+df_u = pd.read_csv(unified_csv)
+
+for c in ["lat_centre", "lon_centre", "score_final_moyen", "score_accessibilite_moyen", "score_concurrence_moyen"]:
+    if c in df_u.columns:
+        df_u[c] = pd.to_numeric(df_u[c], errors="coerce")
+
+# France metropolitaine + valeurs valides
+df_u = df_u[
+    df_u["lat_centre"].between(41.0, 51.5) &
+    df_u["lon_centre"].between(-5.5, 10.5)
+].copy()
+
+# Dedup stricte 1 ligne par commune
+group_cols = ["code_departement", "code_commune_insee"]
+agg_map = {
+    "lat_centre": "mean",
+    "lon_centre": "mean",
+    "score_final_moyen": "mean",
+    "score_accessibilite_moyen": "mean",
+    "score_concurrence_moyen": "mean",
+}
+

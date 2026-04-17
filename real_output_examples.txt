@@ -1,0 +1,56 @@
+|code_departement|code_commune|valeur_fonciere|surface_reelle_bati|prix_m2           |
+only showing top 10 rows
+Nombre de communes (lignes agregees) : 15602
+|code_departement|code_commune|prix_median_m2    |nb_transactions|
+- /home/jovyan/work/data/Filosofi2021_carreaux_200m_csv/carreaux_200m_mart.csv
+- /home/jovyan/work/data/Filosofi2021_carreaux_200m_csv/carreaux_200m_met.csv
+- /home/jovyan/work/data/Filosofi2021_carreaux_200m_csv/carreaux_200m_reun.csv
+Carreaux finaux : 1809025
+Clubs RES Padel : 281
+|Complexe sportif Pierre de Coubertin|Piste de padel|Saint-Chamond      |42             |45.472688|4.532181 |3               |RES   |
+only showing top 5 rows
+Clubs SIRENE Padel : 606
+|TENNIS CLUB PADEL SAVERNE       |Club de Padel|SAVERNE     |67             |48.73680299999999 |7.357940999999999 |NULL            |SIRENE|
+|PADEL TENNIS CLUB ROUSSILLONNAIS|Club de Padel|ROUSSILLON  |38             |45.36311899999999 |4.803427999999999 |NULL            |SIRENE|
+|TENNIS PADEL NAUCELLOIS         |Club de Padel|NAUCELLE    |12             |44.19425999999999 |2.3424410000000004|NULL            |SIRENE|
+|ESPRIT PADEL                    |Club de Padel|SAINT-PRIEST|69             |45.711165999999984|4.9749089999999985|NULL            |SIRENE|
+|PADEL&FOOT STRASBOURG           |Club de Padel|BISCHHEIM   |67             |48.62759699999999 |7.768889          |NULL            |SIRENE|
+Clubs Padel dedupliques : 831
+|PADEL CLUB G4                             |Club de Padel |PROPRIANO      |2A             |41.65573199999998 |8.900732          |NULL            |SIRENE|
+|CASAPERTA PADEL CLUB                      |Club de Padel |GIUNCAGGIO     |2B             |42.159879026941425|9.4333809917407   |NULL            |SIRENE|
+|CORTI PADEL                               |Club de Padel |CORTE          |2B             |42.29845604335644 |9.173763014760837 |NULL            |SIRENE|
+|LE BOULOU PADEL                           |Club de Padel |LE BOULOU      |66             |42.52122296602898 |2.8300050582063974|NULL            |SIRENE|
+|MAES PADEL                                |Club de Padel |CALVI          |2B             |42.538286961947435|8.80097601144708  |NULL            |SIRENE|
+|135296|bus_stop      |45.1973815|5.7762176|
+|135930|bus_stop      |45.2006492|5.7423146|
+|136221|tram_stop     |45.1845327|5.7317282|
+|136570|bus_stop      |45.2169523|5.6815922|
+|136597|bus_stop      |45.2070675|5.6627217|
+ðŸ§® Carreaux scorés accessibilité : 1809025
+ðŸ“Š Nombre total de carreaux accessibilité : 1809025
+ðŸ“¦ Top 20 départements par volume :
+only showing top 20 rows
+|Limousin                  |limousin                  |36           |
+Departements couverts : 96
+|limousin                  |36           |19              |
+|limousin                  |36           |23              |
+|limousin                  |36           |87              |
+Carreaux enrichis : 1809025
+✅ Score concurrentiel calculé : 1,809,025 carreaux
+|IdINSPIRE                     |distance_club_plus_proche|nb_clubs_5km|score_concurrence|
+✅ Base Step6 prête : 1,797,197 carreaux après filtre rentabilité
+ðŸ“Š Top1000 carreaux: 1,000
+ðŸ—ºï¸ Communes retenues (>=3 carreaux top1000): 111
+ðŸ“Š Nombre total de carreaux scorés (France) : 1,797,197
+[1/7] dash_carreaux_full : 1,797,197 lignes
+[2/7] dash_communes_agg : 122,236 lignes
+[3/7] dash_top_zones : 1,000 lignes
+[4/7] dash_clubs : 18,637 lignes
+✅ Volume total : 110 Mo
+✅ Top departement : 30
+✅ Meilleure commune : 34172
+CSV utilise: /home/jovyan/work/data/dash_ready/dash_clubs.csv/part-00000-dd665692-3d9d-43bf-a242-7bcbbf95c070-c000.csv
+- ZIP unique: /home/jovyan/work/data/dash_ready/plotly_bundle/plotly_bundle.zip (13.47 Mo)
+/tmp/ipykernel_337/56026947.py:24: DtypeWarning: Columns (0) have mixed types. Specify dtype option on import or set low_memory=False.
+✅ plotly_map_communes.csv : 35,139 lignes
+✅ plotly_map_clubs.csv    : 18,637 lignes

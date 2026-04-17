@@ -1,0 +1,19 @@
+CELL 1:
+# 🎾 PadelSpot – Pipeline de Données
+
+
+
+Ce notebook présente une chaîne complète de préparation de données pour aider à décider où implanter un club de padel. Chaque étape transforme des données brutes en informations plus simples à lire. Les résultats affichés dans les DataFrames permettent de vérifier concrètement que les données deviennent plus propres et plus utiles.
+
+---
+CELL 2:
+### Installation des dépendances
+
+
+
+Cette cellule installe les bibliothèques nécessaires au calcul, à la géographie et à la visualisation. Elle ne produit pas encore de résultat métier, mais elle garantit que les étapes suivantes peuvent s'exécuter correctement.
+
+---
+CELL 3:
+%pip install pyspark plotly ipywidgets pandas numpy anywidget osmium pyproj xgboost -q
+---
