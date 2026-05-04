@@ -1,0 +1,4 @@
+docker:
+  compose_file: docker-compose.yml
+  service_name: "{{ spark_service_name }}"
+  container_root: "{{ container_root }}"

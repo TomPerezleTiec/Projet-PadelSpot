@@ -1,0 +1,42 @@
+docker:
+  compose_file: docker-compose.yml
+  service_name: jupyter
+  container_root: /home/jovyan/work
+
+stages:
+  1:
+    name: dvf
+    script: src/padelspot/jobs/01_donnees_dvf_demandes_de_valeurs_foncieres.py
+    expected_outputs:
+      - data/output/dvf_clean
+  2:
+    name: filosofi
+    script: src/padelspot/jobs/02_donnees_filosofi_insee_2021.py
+    expected_outputs:
+      - data/output/filosofi_clean
+  3:
+    name: concurrence
+    script: src/padelspot/jobs/03_clubs_existants_res_sirene.py
+    expected_outputs:
+      - data/output/concurrence_padel
+  4:
+    name: accessibilite
+    script: src/padelspot/jobs/04_accessibilite_openstreetmap.py
+    expected_outputs:
+      - data/output/accessibilite_clean
+  5:
+    name: trends
+    script: src/padelspot/jobs/05_demande_latente_google_trends.py
+    expected_outputs:
+      - data/output/trends_joined
+  6:
+    name: score
+    script: src/padelspot/jobs/06_score_composite_dimplantation.py
+    expected_outputs:
+      - data/output/score_final_full
+  7:
+    name: dash_ready
+    script: src/padelspot/jobs/07_preparation_des_exports_dash_ready.py
+    expected_outputs:
+      - data/dash_ready
+

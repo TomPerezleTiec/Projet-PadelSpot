@@ -1,0 +1,11 @@
+stage_01_output:
+  type: json.JSONDataset
+  filepath: data/outputs/stage_01_ingestion/metadata.json
+
+stage_02_output:
+  type: json.JSONDataset
+  filepath: data/outputs/stage_02_transformation/metadata.json
+
+stage_03_output:
+  type: json.JSONDataset
+  filepath: data/outputs/stage_03_delivery/metadata.json

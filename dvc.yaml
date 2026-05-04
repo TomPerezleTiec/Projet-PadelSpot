@@ -1,0 +1,79 @@
+stages:
+  build_stage_scripts:
+    cmd: python scripts/build_stage_scripts.py
+    deps:
+      - padelspot.ipynb
+      - scripts/build_stage_scripts.py
+    outs:
+      - src/padelspot/jobs
+      - src/padelspot/main.py
+
+  stage_01_dvf:
+    cmd: kedro run --pipeline stage_01_dvf
+    deps:
+      - src/padelspot/jobs/01_donnees_dvf_demandes_de_valeurs_foncieres.py
+      - src/padelspot/kedro_nodes.py
+      - src/padelspot/pipelines/stage_01_dvf/pipeline.py
+      - docker-compose.yml
+    outs:
+      - data/output/dvf_clean
+
+  stage_02_filosofi:
+    cmd: kedro run --pipeline stage_02_filosofi
+    deps:
+      - src/padelspot/jobs/02_donnees_filosofi_insee_2021.py
+      - src/padelspot/kedro_nodes.py
+      - src/padelspot/pipelines/stage_02_filosofi/pipeline.py
+      - docker-compose.yml
+    outs:
+      - data/output/filosofi_clean
+
+  stage_03_concurrence:
+    cmd: kedro run --pipeline stage_03_concurrence
+    deps:
+      - src/padelspot/jobs/03_clubs_existants_res_sirene.py
+      - src/padelspot/kedro_nodes.py
+      - src/padelspot/pipelines/stage_03_concurrence/pipeline.py
+      - docker-compose.yml
+    outs:
+      - data/output/concurrence_padel
+
+  stage_04_accessibilite:
+    cmd: kedro run --pipeline stage_04_accessibilite
+    deps:
+      - src/padelspot/jobs/04_accessibilite_openstreetmap.py
+      - src/padelspot/kedro_nodes.py
+      - src/padelspot/pipelines/stage_04_accessibilite/pipeline.py
+      - docker-compose.yml
+    outs:
+      - data/output/accessibilite_clean
+
+  stage_05_trends:
+    cmd: kedro run --pipeline stage_05_trends
+    deps:
+      - src/padelspot/jobs/05_demande_latente_google_trends.py
+      - src/padelspot/kedro_nodes.py
+      - src/padelspot/pipelines/stage_05_trends/pipeline.py
+      - docker-compose.yml
+    outs:
+      - data/output/trends_joined
+
+  stage_06_score:
+    cmd: kedro run --pipeline stage_06_score
+    deps:
+      - src/padelspot/jobs/06_score_composite_dimplantation.py
+      - src/padelspot/kedro_nodes.py
+      - src/padelspot/pipelines/stage_06_score/pipeline.py
+      - docker-compose.yml
+    outs:
+      - data/output/score_final_full
+
+  stage_07_dash_ready:
+    cmd: kedro run --pipeline stage_07_dash_ready
+    deps:
+      - src/padelspot/jobs/07_preparation_des_exports_dash_ready.py
+      - src/padelspot/kedro_nodes.py
+      - src/padelspot/pipelines/stage_07_dash_ready/pipeline.py
+      - docker-compose.yml
+    outs:
+      - data/dash_ready

@@ -1,0 +1,37 @@
+_answers_file: .copier-answers.yml
+_min_copier_version: "9.0.0"
+_templates_suffix: ""
+
+project_name:
+  type: str
+  default: "My Data Project"
+
+project_slug:
+  type: str
+  default: "{{ project_name|lower|replace(' ', '-')|replace('_', '-') }}"
+
+python_package:
+  type: str
+  default: "{{ project_slug|replace('-', '_') }}"
+
+author_name:
+  type: str
+  default: "Your Name"
+
+spark_service_name:
+  type: str
+  default: "jupyter"
+
+container_root:
+  type: str
+  default: "/home/jovyan/work"
+
+_message_after_copy: |
+  Template generated successfully.
+  Next steps:
+    1. cd {{ project_slug }}
+    2. python -m venv .venv
+    3. .venv\Scripts\activate
+    4. pip install -e .
+    5. dvc init
+    6. kedro run

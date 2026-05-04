@@ -1,0 +1,10 @@
+pyspark
+plotly
+ipywidgets
+pandas
+numpy
+geopandas
+anywidget
+osmium
+pyproj
+xgboost

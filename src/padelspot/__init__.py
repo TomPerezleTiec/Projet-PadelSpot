@@ -1,0 +1,1 @@
+"""PadelSpot package."""

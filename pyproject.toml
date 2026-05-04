@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "padelspot"
+version = "0.1.0"
+description = "PadelSpot data engineering project scaffolded with Kedro and DVC."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "kedro>=0.19.10,<0.20",
+  "kedro-datasets>=4.1.0,<5",
+  "dvc>=3.58,<4",
+  "pandas>=2.2,<3",
+  "pyspark>=4.0.0,<5",
+  "pyarrow>=23.0.0,<24",
+  "ipython>=8.0,<9",
+  "pyproj>=3.7,<4",
+  "geopandas>=1.0,<2",
+  "plotly>=6.0,<7",
+  "ipywidgets>=8.0,<9",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0,<9",
+]
+
+[project.scripts]
+padelspot-run = "padelspot.main:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.kedro]
+package_name = "padelspot"
+project_name = "PadelSpot"
+kedro_init_version = "0.19.10"
+source_dir = "src"
+
+
+[tool.kedro_telemetry]
+project_id = "a5e9b588312c454f827c661ec077654a"

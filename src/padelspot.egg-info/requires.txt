@@ -1,0 +1,14 @@
+kedro<0.20,>=0.19.10
+kedro-datasets<5,>=4.1.0
+dvc<4,>=3.58
+pandas<3,>=2.2
+pyspark<5,>=4.0.0
+pyarrow<24,>=23.0.0
+ipython<9,>=8.0
+pyproj<4,>=3.7
+geopandas<2,>=1.0
+plotly<7,>=6.0
+ipywidgets<9,>=8.0
+
+[dev]
+pytest<9,>=8.0

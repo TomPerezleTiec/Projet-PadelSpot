@@ -1,0 +1,44 @@
+dvf_clean:
+  type: partitions.PartitionedDataset
+  path: data/output/dvf_clean
+  dataset:
+    type: pandas.ParquetDataset
+
+filosofi_clean:
+  type: partitions.PartitionedDataset
+  path: data/output/filosofi_clean
+  dataset:
+    type: pandas.ParquetDataset
+
+concurrence_padel:
+  type: partitions.PartitionedDataset
+  path: data/output/concurrence_padel
+  dataset:
+    type: pandas.ParquetDataset
+
+accessibilite_clean:
+  type: partitions.PartitionedDataset
+  path: data/output/accessibilite_clean
+  dataset:
+    type: pandas.ParquetDataset
+
+trends_joined:
+  type: partitions.PartitionedDataset
+  path: data/output/trends_joined
+  dataset:
+    type: pandas.ParquetDataset
+
+score_final_full:
+  type: partitions.PartitionedDataset
+  path: data/output/score_final_full
+  dataset:
+    type: pandas.ParquetDataset
+
+dash_top_zones_geojson:
+  type: json.JSONDataset
+  filepath: data/dash_ready/dash_top_zones.geojson
+
+dash_metadata:
+  type: json.JSONDataset
+  filepath: data/dash_ready/dash_metadata.json
+

@@ -10,3 +10,10 @@ __pycache__/
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Data engineering / experiment tracking
+mlruns/
+.dvc/
+.dvc/cache/
+.kedro/
+.DS_Store

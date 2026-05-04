@@ -1,0 +1,12 @@
+services:
+  {{ spark_service_name }}:
+    image: quay.io/jupyter/pyspark-notebook:latest
+    container_name: {{ project_slug }}_spark
+    ports:
+      - "8888:8888"
+      - "4040:4040"
+    volumes:
+      - .:{{ container_root }}
+    environment:
+      - JUPYTER_TOKEN={{ project_slug }}
+    mem_limit: 12g

@@ -1,0 +1,52 @@
+schema: '2.0'
+stages:
+  build_stage_scripts:
+    cmd: python scripts/build_stage_scripts.py
+    deps:
+    - path: padelspot.ipynb
+      hash: md5
+      md5: fced648dd7ffc5c9d5e91201d91bbef4
+      size: 241409
+    - path: scripts/build_stage_scripts.py
+      hash: md5
+      md5: 505b71587c7288a4187e89e03db79766
+      size: 9474
+    outs:
+    - path: src/padelspot/jobs
+      hash: md5
+      md5: a6bd05a71f619cdba00513d5cec5a82d.dir
+      size: 149802
+      nfiles: 7
+    - path: src/padelspot/main.py
+      hash: md5
+      md5: 57eabfd68a6b41eed2a9f25bea4a0c90
+      size: 1101
+  stage_01_dvf:
+    cmd: kedro run --pipeline stage_01_dvf
+    deps:
+    - path: docker-compose.yml
+      hash: md5
+      md5: e80887c856d6b58a393c218bc5c350de
+      size: 274
+      isexec: true
+    - path: src/padelspot/jobs/01_donnees_dvf_demandes_de_valeurs_foncieres.py
+      hash: md5
+      md5: 67a5dae06be76210c0bbae42078ab66c
+      size: 9616
+      isexec: true
+    - path: src/padelspot/kedro_nodes.py
+      hash: md5
+      md5: 7a2a792d71f22faadd47bef532e849f9
+      size: 2219
+      isexec: true
+    - path: src/padelspot/pipelines/stage_01_dvf/pipeline.py
+      hash: md5
+      md5: 9668d5d01bf2cad7eac09738722977c6
+      size: 378
+      isexec: true
+    outs:
+    - path: data/output/dvf_clean
+      hash: md5
+      md5: 3636e2c8dc5bc10c6911fb233ac5cb9d.dir
+      size: 309619
+      nfiles: 196
