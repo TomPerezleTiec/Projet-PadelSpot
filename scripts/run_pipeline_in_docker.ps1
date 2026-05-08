@@ -60,4 +60,4 @@ if (-not $HasPySpark -and $InstallDeps) {
 }
 
 Write-Host "Execution du pipeline dans Docker..."
-docker compose exec jupyter python $GeneratedPipelineDocker
+docker compose exec jupyter /home/jovyan/New-Projet-PadelSpot-v2/.venv/bin/python $GeneratedPipelineDocker

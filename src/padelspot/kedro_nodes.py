@@ -9,6 +9,10 @@ from typing import Iterable
 from padelspot.config import get_project_paths
 
 
+def _is_running_inside_container() -> bool:
+    return Path("/.dockerenv").exists()
+
+
 def _run_command(command: list[str], cwd: Path) -> None:
     subprocess.run(command, cwd=str(cwd), check=True)
 
@@ -48,6 +52,11 @@ def run_stage_in_docker(
     container_script_path = f"{container_root}/{normalized_relative_script}"
 
     if shutil.which("docker") is None:
+        if not _is_running_inside_container():
+            raise RuntimeError(
+                "Docker CLI is not available outside a container. Run this stage "
+                "through docker compose or inside the project container."
+            )
         _run_command([sys.executable, str(local_script_path)], cwd=paths.root)
     else:
         ensure_docker_service(compose_file=compose_file, service_name=service_name)

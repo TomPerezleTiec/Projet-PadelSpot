@@ -256,8 +256,18 @@ def main() -> None:
             cumulative_sources.append("\n".join(sections[previous_stage]["code"]))
         shared_imports = collect_global_import_blocks_from_sources(cumulative_sources)
         filename = OUTPUT_DIR / f"{stage_id:02d}_{slugify(title)}.py"
+        script_text = render_stage_script(stage_id, title, shared_imports, prelude_code, stage_code)
+        if stage_id == 7:
+            script_text = script_text.replace(
+                "/home/jovyan/work/data/output/clubs_concurrents/concurrence_padel/",
+                "/home/jovyan/work/data/output/concurrence_padel/",
+            )
+            script_text = script_text.replace(
+                "/home/jovyan/work/data/output/clubs_concurrents/",
+                "/home/jovyan/work/data/output/concurrence_padel/",
+            )
         filename.write_text(
-            render_stage_script(stage_id, title, shared_imports, prelude_code, stage_code),
+            script_text,
             encoding="utf-8",
         )
         generated.append(filename)

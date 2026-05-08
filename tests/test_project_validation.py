@@ -1,11 +1,23 @@
 from __future__ import annotations
 
 import re
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+EXPECTED_DVC_STAGES = {
+    "build_stage_scripts",
+    "stage_01_dvf",
+    "stage_02_filosofi",
+    "stage_03_concurrence",
+    "stage_04_accessibilite",
+    "stage_05_trends",
+    "stage_06_score",
+    "stage_07_dash_ready",
+}
 
 
 def _extract_dvc_stage_names(path: Path) -> set[str]:
@@ -21,17 +33,21 @@ def _extract_dvc_stage_names(path: Path) -> set[str]:
 
 
 class ProjectValidationTests(unittest.TestCase):
-    def test_dvc_lock_covers_all_declared_stages(self) -> None:
+    def test_dvc_yaml_declares_all_expected_stages(self) -> None:
         declared_stages = _extract_dvc_stage_names(PROJECT_ROOT / "dvc.yaml")
-        locked_stages = _extract_dvc_stage_names(PROJECT_ROOT / "dvc.lock")
 
-        self.assertTrue(
-            declared_stages.issubset(locked_stages),
-            msg=(
-                "Some declared DVC stages are missing from dvc.lock: "
-                f"{sorted(declared_stages - locked_stages)}"
-            ),
+        self.assertSetEqual(declared_stages, EXPECTED_DVC_STAGES)
+
+    def test_dvc_repro_dry_run_succeeds(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "-m", "dvc", "repro", "--dry"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
         )
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
 
     def test_copier_template_is_present(self) -> None:
         template_root = PROJECT_ROOT / "scaffolding" / "copier-template"

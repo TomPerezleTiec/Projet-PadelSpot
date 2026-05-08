@@ -1,28 +1,20 @@
 schema: '2.0'
 stages:
   build_stage_scripts:
-    cmd: python scripts/build_stage_scripts.py
+    cmd: /opt/conda/bin/python scripts/build_stage_scripts.py
     deps:
     - path: padelspot.ipynb
       hash: md5
       md5: fced648dd7ffc5c9d5e91201d91bbef4
       size: 241409
+      isexec: true
     - path: scripts/build_stage_scripts.py
       hash: md5
-      md5: 505b71587c7288a4187e89e03db79766
-      size: 9474
-    outs:
-    - path: src/padelspot/jobs
-      hash: md5
-      md5: a6bd05a71f619cdba00513d5cec5a82d.dir
-      size: 149802
-      nfiles: 7
-    - path: src/padelspot/main.py
-      hash: md5
-      md5: 57eabfd68a6b41eed2a9f25bea4a0c90
-      size: 1101
+      md5: a0f6331b99c7f05230e92c8d88f1a8e0
+      size: 9946
+      isexec: true
   stage_01_dvf:
-    cmd: kedro run --pipeline stage_01_dvf
+    cmd: /opt/conda/bin/python -m kedro run --pipeline stage_01_dvf
     deps:
     - path: docker-compose.yml
       hash: md5
@@ -31,13 +23,12 @@ stages:
       isexec: true
     - path: src/padelspot/jobs/01_donnees_dvf_demandes_de_valeurs_foncieres.py
       hash: md5
-      md5: 67a5dae06be76210c0bbae42078ab66c
-      size: 9616
-      isexec: true
+      md5: 0e913a8b74c9fb8b154d46d44bd0ba92
+      size: 9351
     - path: src/padelspot/kedro_nodes.py
       hash: md5
-      md5: 7a2a792d71f22faadd47bef532e849f9
-      size: 2219
+      md5: db9f6d555cd811f32a99419808128a04
+      size: 2441
       isexec: true
     - path: src/padelspot/pipelines/stage_01_dvf/pipeline.py
       hash: md5
@@ -47,6 +38,174 @@ stages:
     outs:
     - path: data/output/dvf_clean
       hash: md5
-      md5: 3636e2c8dc5bc10c6911fb233ac5cb9d.dir
+      md5: 0b41e84b09b5d0c12eb6b25483c14550.dir
       size: 309619
       nfiles: 196
+  stage_02_filosofi:
+    cmd: /opt/conda/bin/python -m kedro run --pipeline stage_02_filosofi
+    deps:
+    - path: docker-compose.yml
+      hash: md5
+      md5: e80887c856d6b58a393c218bc5c350de
+      size: 274
+      isexec: true
+    - path: src/padelspot/jobs/02_donnees_filosofi_insee_2021.py
+      hash: md5
+      md5: 8e68c9cc5736acb1b659a630cf1e7b62
+      size: 13994
+    - path: src/padelspot/kedro_nodes.py
+      hash: md5
+      md5: db9f6d555cd811f32a99419808128a04
+      size: 2441
+      isexec: true
+    - path: src/padelspot/pipelines/stage_02_filosofi/pipeline.py
+      hash: md5
+      md5: d049bc6d0e961c22f71950a71a5179dd
+      size: 379
+      isexec: true
+    outs:
+    - path: data/output/filosofi_clean
+      hash: md5
+      md5: 34abf4df32ced17df6d017ef7d930e0c.dir
+      size: 76597332
+      nfiles: 270
+  stage_03_concurrence:
+    cmd: /opt/conda/bin/python -m kedro run --pipeline stage_03_concurrence
+    deps:
+    - path: docker-compose.yml
+      hash: md5
+      md5: e80887c856d6b58a393c218bc5c350de
+      size: 274
+      isexec: true
+    - path: src/padelspot/jobs/03_clubs_existants_res_sirene.py
+      hash: md5
+      md5: f9ebf1e90eeb5fded1b2cdeec86150b5
+      size: 11352
+    - path: src/padelspot/kedro_nodes.py
+      hash: md5
+      md5: db9f6d555cd811f32a99419808128a04
+      size: 2441
+      isexec: true
+    - path: src/padelspot/pipelines/stage_03_concurrence/pipeline.py
+      hash: md5
+      md5: e5548e8c2713fc27bd4cbbac5fae99ab
+      size: 387
+      isexec: true
+    outs:
+    - path: data/output/concurrence_padel
+      hash: md5
+      md5: 81ca2b6d6979bb78213220eccda634e3.dir
+      size: 245476
+      nfiles: 188
+  stage_04_accessibilite:
+    cmd: /opt/conda/bin/python -m kedro run --pipeline stage_04_accessibilite
+    deps:
+    - path: docker-compose.yml
+      hash: md5
+      md5: e80887c856d6b58a393c218bc5c350de
+      size: 274
+      isexec: true
+    - path: src/padelspot/jobs/04_accessibilite_openstreetmap.py
+      hash: md5
+      md5: fd7de1d51ee46aaf91171d5e0ba6eb6f
+      size: 24883
+    - path: src/padelspot/kedro_nodes.py
+      hash: md5
+      md5: db9f6d555cd811f32a99419808128a04
+      size: 2441
+      isexec: true
+    - path: src/padelspot/pipelines/stage_04_accessibilite/pipeline.py
+      hash: md5
+      md5: 06bf25bb615a361b778d8be7ca3a1b1e
+      size: 394
+      isexec: true
+    outs:
+    - path: data/output/accessibilite_clean
+      hash: md5
+      md5: 44ceea408b63e56fa33d61b9d441b71a.dir
+      size: 117968086
+      nfiles: 962
+  stage_05_trends:
+    cmd: /opt/conda/bin/python -m kedro run --pipeline stage_05_trends
+    deps:
+    - path: docker-compose.yml
+      hash: md5
+      md5: e80887c856d6b58a393c218bc5c350de
+      size: 274
+      isexec: true
+    - path: src/padelspot/jobs/05_demande_latente_google_trends.py
+      hash: md5
+      md5: 76fcb54e6dfee4f1baed10875d9385c7
+      size: 10611
+    - path: src/padelspot/kedro_nodes.py
+      hash: md5
+      md5: db9f6d555cd811f32a99419808128a04
+      size: 2441
+      isexec: true
+    - path: src/padelspot/pipelines/stage_05_trends/pipeline.py
+      hash: md5
+      md5: ce5c56bb70440bd2fea718ab01edb530
+      size: 376
+      isexec: true
+    outs:
+    - path: data/output/trends_joined
+      hash: md5
+      md5: 5a53e4bcd334ba98d22962c2ec46b845.dir
+      size: 76622630
+      nfiles: 264
+  stage_06_score:
+    cmd: /opt/conda/bin/python -m kedro run --pipeline stage_06_score
+    deps:
+    - path: docker-compose.yml
+      hash: md5
+      md5: e80887c856d6b58a393c218bc5c350de
+      size: 274
+      isexec: true
+    - path: src/padelspot/jobs/06_score_composite_dimplantation.py
+      hash: md5
+      md5: fa7c99854d29ad76919eb80a1e644afa
+      size: 20305
+    - path: src/padelspot/kedro_nodes.py
+      hash: md5
+      md5: db9f6d555cd811f32a99419808128a04
+      size: 2441
+      isexec: true
+    - path: src/padelspot/pipelines/stage_06_score/pipeline.py
+      hash: md5
+      md5: 78d4a50202e418ca37294ab3415500f1
+      size: 377
+      isexec: true
+    outs:
+    - path: data/output/score_final_full
+      hash: md5
+      md5: 62ae579f741291d38a543b90b43e882e.dir
+      size: 110841151
+      nfiles: 762
+  stage_07_dash_ready:
+    cmd: /opt/conda/bin/python -m kedro run --pipeline stage_07_dash_ready
+    deps:
+    - path: docker-compose.yml
+      hash: md5
+      md5: e80887c856d6b58a393c218bc5c350de
+      size: 274
+      isexec: true
+    - path: src/padelspot/jobs/07_preparation_des_exports_dash_ready.py
+      hash: md5
+      md5: 4b2f799fd76efafd5e8973a20c480420
+      size: 57392
+    - path: src/padelspot/kedro_nodes.py
+      hash: md5
+      md5: db9f6d555cd811f32a99419808128a04
+      size: 2441
+      isexec: true
+    - path: src/padelspot/pipelines/stage_07_dash_ready/pipeline.py
+      hash: md5
+      md5: 8a6da4d4281166218092e0fd4d8e852f
+      size: 379
+      isexec: true
+    outs:
+    - path: data/dash_ready
+      hash: md5
+      md5: b8780608af17f855bebe8498307e2182.dir
+      size: 111236973
+      nfiles: 996

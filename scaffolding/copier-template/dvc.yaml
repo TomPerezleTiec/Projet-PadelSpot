@@ -1,6 +1,6 @@
 stages:
   stage_01_ingestion:
-    cmd: kedro run --pipeline stage_01_ingestion
+    cmd: python -m kedro run --pipeline stage_01_ingestion
     deps:
       - src/{{ python_package }}/jobs/01_ingestion.py
       - src/{{ python_package }}/kedro_nodes.py
@@ -10,7 +10,7 @@ stages:
       - data/outputs/stage_01_ingestion
 
   stage_02_transformation:
-    cmd: kedro run --pipeline stage_02_transformation
+    cmd: python -m kedro run --pipeline stage_02_transformation
     deps:
       - src/{{ python_package }}/jobs/02_transformation.py
       - src/{{ python_package }}/kedro_nodes.py
@@ -20,7 +20,7 @@ stages:
       - data/outputs/stage_02_transformation
 
   stage_03_delivery:
-    cmd: kedro run --pipeline stage_03_delivery
+    cmd: python -m kedro run --pipeline stage_03_delivery
     deps:
       - src/{{ python_package }}/jobs/03_delivery.py
       - src/{{ python_package }}/kedro_nodes.py

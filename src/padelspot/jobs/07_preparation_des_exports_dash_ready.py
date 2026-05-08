@@ -266,8 +266,8 @@ PATHS = {
     "accessibilite_clean": "/home/jovyan/work/data/output/accessibilite_clean/",
     "filosofi_clean": "/home/jovyan/work/data/output/filosofi_clean/",
     "dvf_clean": "/home/jovyan/work/data/output/dvf_clean/",
-    "concurrence_padel": "/home/jovyan/work/data/output/clubs_concurrents/concurrence_padel/",
-    "clubs_concurrents": "/home/jovyan/work/data/output/clubs_concurrents/",
+    "concurrence_padel": "/home/jovyan/work/data/output/concurrence_padel/",
+    "clubs_concurrents": "/home/jovyan/work/data/output/concurrence_padel/",
     "trends_joined": "/home/jovyan/work/data/output/trends_joined/",
     "score_final": "/home/jovyan/work/data/output/score_final/",
     "score_final_full": "/home/jovyan/work/data/output/score_final_full/",
@@ -641,7 +641,7 @@ if conc_path is None:
 
 annexe_path = _first_existing_path([
     PATHS["clubs_concurrents"],
-    "/home/jovyan/work/data/output/clubs_concurrents/"
+    "/home/jovyan/work/data/output/concurrence_padel/"
 ])
 if annexe_path is None:
     raise FileNotFoundError("Aucun chemin clubs_concurrents valide trouve.")
@@ -757,6 +757,50 @@ count_dash_clubs = spark.read.parquet(path_dash_clubs_parquet).count()
 print(f"[4/7] dash_clubs : {count_dash_clubs:,} lignes")
 print(f"Verification write parquet OK -> {path_dash_clubs_parquet}")
 
+
+# ============================================================
+# [5/7] dash_departements_stats
+# ============================================================
+path_dash_deps_parquet = os.path.join(OUTPUT_DASH, "dash_departements_stats.parquet")
+path_dash_deps_csv = os.path.join(OUTPUT_DASH, "dash_departements_stats.csv")
+
+df_dash_deps = df_dash_carreaux_full.groupBy("code_departement").agg(
+    F.count("*").alias("nb_carreaux"),
+    F.avg("score_final").alias("score_final_moyen"),
+    F.expr("percentile_approx(score_final, 0.9)").alias("score_final_p90"),
+    F.avg("score_concurrence").alias("score_concurrence_moyen"),
+    F.avg("score_accessibilite").alias("score_accessibilite_moyen"),
+    F.avg("score_immobilier").alias("score_immobilier_moyen"),
+    F.avg("score_revenu").alias("score_revenu_moyen"),
+    F.avg("part_cible_padel").alias("part_cible_padel_moyen"),
+    F.avg("indice_demande_trends").alias("indice_demande_trends_moyen"),
+    F.avg("prix_median_m2").alias("prix_median_m2_moyen"),
+    F.avg("ind_snv").alias("ind_snv_moyen"),
+    F.avg("nb_clubs_5km").alias("nb_clubs_5km_moyen"),
+).fillna(
+    {
+        "code_departement": "N/A",
+        "nb_carreaux": 0,
+        "score_final_moyen": 0.0,
+        "score_final_p90": 0.0,
+        "score_concurrence_moyen": 0.0,
+        "score_accessibilite_moyen": 0.0,
+        "score_immobilier_moyen": 0.0,
+        "score_revenu_moyen": 0.0,
+        "part_cible_padel_moyen": 0.0,
+        "indice_demande_trends_moyen": 0.0,
+        "prix_median_m2_moyen": 0.0,
+        "ind_snv_moyen": 0.0,
+        "nb_clubs_5km_moyen": 0.0,
+    }
+)
+
+df_dash_deps.write.mode("overwrite").parquet(path_dash_deps_parquet)
+df_dash_deps.coalesce(1).write.mode("overwrite").option("header", True).csv(path_dash_deps_csv)
+count_dash_deps = spark.read.parquet(path_dash_deps_parquet).count()
+print(f"[5/7] dash_departements_stats : {count_dash_deps:,} lignes")
+print(f"Verification write parquet OK -> {path_dash_deps_parquet}")
+
 """
 ETAPE 7 - CELLULE 3/3
 Generation de dash_metadata.json :
@@ -801,6 +845,12 @@ def _path_size_bytes(path):
             if os.path.isfile(fp):
                 total += os.path.getsize(fp)
     return total
+
+
+def _safe_parquet_count(path):
+    if not os.path.exists(path):
+        return 0
+    return int(spark.read.parquet(path).count())
 
 
 # Volumes
@@ -858,12 +908,12 @@ tables_info = {
     },
     "dash_transport": {
         "path": path_dash_transport,
-        "nb_lignes": int(spark.read.parquet(path_dash_transport).count()),
+        "nb_lignes": _safe_parquet_count(path_dash_transport),
         "taille_mo": _bytes_to_mb(_path_size_bytes(path_dash_transport)),
     },
     "dash_roads": {
         "path": path_dash_roads,
-        "nb_lignes": int(spark.read.parquet(path_dash_roads).count()),
+        "nb_lignes": _safe_parquet_count(path_dash_roads),
         "taille_mo": _bytes_to_mb(_path_size_bytes(path_dash_roads)),
     },
     "dash_departements_stats": {

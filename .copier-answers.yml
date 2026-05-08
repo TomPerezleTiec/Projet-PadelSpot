@@ -1,0 +1,6 @@
+project_name: "Projet-PadelSpot"
+project_slug: "projet-padelspot"
+python_package: "padelspot"
+author_name: "Tom"
+spark_service_name: "jupyter"
+container_root: "/home/jovyan/work"
