@@ -12,6 +12,8 @@ src/padelspot.egg-info/dependency_links.txt
 src/padelspot.egg-info/entry_points.txt
 src/padelspot.egg-info/requires.txt
 src/padelspot.egg-info/top_level.txt
+src/padelspot/apps/__init__.py
+src/padelspot/apps/streaming_dash_app.py
 src/padelspot/jobs/01_donnees_dvf_demandes_de_valeurs_foncieres.py
 src/padelspot/jobs/02_donnees_filosofi_insee_2021.py
 src/padelspot/jobs/03_clubs_existants_res_sirene.py
@@ -36,3 +38,6 @@ src/padelspot/pipelines/stage_06_score/__init__.py
 src/padelspot/pipelines/stage_06_score/pipeline.py
 src/padelspot/pipelines/stage_07_dash_ready/__init__.py
 src/padelspot/pipelines/stage_07_dash_ready/pipeline.py
+src/padelspot/streaming/__init__.py
+src/padelspot/streaming/club_events_stream.py
+tests/test_project_validation.py

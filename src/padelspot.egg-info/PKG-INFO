@@ -14,7 +14,9 @@ Requires-Dist: ipython<9,>=8.0
 Requires-Dist: pyproj<4,>=3.7
 Requires-Dist: geopandas<2,>=1.0
 Requires-Dist: plotly<7,>=6.0
+Requires-Dist: dash<4,>=3.0
 Requires-Dist: ipywidgets<9,>=8.0
+Requires-Dist: kafka-python<3,>=2.0
 Provides-Extra: dev
 Requires-Dist: pytest<9,>=8.0; extra == "dev"
 

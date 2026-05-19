@@ -1,5 +1,6 @@
 pyspark
 plotly
+dash
 ipywidgets
 pandas
 numpy

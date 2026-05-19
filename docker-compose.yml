@@ -1,12 +1,36 @@
 services:
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: padelspot_kafka
+    ports:
+      - "9094:9094"
+    environment:
+      - CLUSTER_ID=MkU3OEVBNTcwNTJENDM2Qk
+      - KAFKA_NODE_ID=1
+      - KAFKA_PROCESS_ROLES=broker,controller
+      - KAFKA_CONTROLLER_QUORUM_VOTERS=1@kafka:9093
+      - KAFKA_LISTENERS=PLAINTEXT://kafka:9092,CONTROLLER://kafka:9093,EXTERNAL://0.0.0.0:9094
+      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
+      - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      - KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT
+      - KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1
+      - KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1
+      - KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1
+      - KAFKA_AUTO_CREATE_TOPICS_ENABLE=true
+
   jupyter:
     image: quay.io/jupyter/pyspark-notebook:latest
     container_name: padelspot_spark
     ports:
       - "8888:8888"
       - "4040:4040"
+      - "8050:8050"
     volumes:
       - .:/home/jovyan/work
     environment:
       - JUPYTER_TOKEN=padel
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    depends_on:
+      - kafka
     mem_limit: 12g
