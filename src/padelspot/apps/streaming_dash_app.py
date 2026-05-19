@@ -529,6 +529,15 @@ def _numeric_bounds(data: pd.DataFrame, col: str, fallback: tuple[float, float])
     return low, high
 
 
+def _range_marks(low: float, high: float, decimals: int = 0) -> dict[float, str]:
+    mid = (low + high) / 2
+    return {
+        low: f"{low:.{decimals}f}",
+        mid: f"{mid:.{decimals}f}",
+        high: f"{high:.{decimals}f}",
+    }
+
+
 def _sizes(df: pd.DataFrame) -> np.ndarray:
     courts = pd.to_numeric(df["nombre_de_courts"], errors="coerce").fillna(2)
     return np.clip(4.5 + courts * 0.75, 5.5, 13.0)
@@ -690,6 +699,9 @@ initial_data = load_clubs_dataframe()
 score_min, score_max = _numeric_bounds(initial_data, "score_live", (0.0, 1.0))
 price_min, price_max = _numeric_bounds(initial_data, "prix_median_m2_zone", (0.0, 5000.0))
 trends_min, trends_max = _numeric_bounds(initial_data, "indice_demande_trends_zone", (0.0, 100.0))
+score_marks = _range_marks(score_min, score_max, 2)
+price_marks = _range_marks(price_min, price_max, 0)
+trends_marks = _range_marks(trends_min, trends_max, 0)
 all_departments = sorted(initial_data["departement_code"].dropna().astype(str).unique().tolist()) if not initial_data.empty else []
 
 
@@ -794,11 +806,38 @@ app.layout = html.Div(
                             [
                                 html.H2("Scores"),
                                 html.Label("Score implantation"),
-                                dcc.RangeSlider(id="score-range", min=score_min, max=score_max, step=max((score_max - score_min) / 250, 0.001), value=[score_min, score_max], tooltip={"placement": "bottom", "always_visible": False}),
+                                dcc.RangeSlider(
+                                    id="score-range",
+                                    min=score_min,
+                                    max=score_max,
+                                    step=max((score_max - score_min) / 200, 0.001),
+                                    value=[score_min, score_max],
+                                    marks=score_marks,
+                                    allowCross=False,
+                                    tooltip={"placement": "bottom", "always_visible": False},
+                                ),
                                 html.Label("Prix median m2"),
-                                dcc.RangeSlider(id="price-range", min=price_min, max=price_max, step=max((price_max - price_min) / 250, 1), value=[price_min, price_max]),
+                                dcc.RangeSlider(
+                                    id="price-range",
+                                    min=price_min,
+                                    max=price_max,
+                                    step=max((price_max - price_min) / 200, 1),
+                                    value=[price_min, price_max],
+                                    marks=price_marks,
+                                    allowCross=False,
+                                    tooltip={"placement": "bottom", "always_visible": False},
+                                ),
                                 html.Label("Google Trends"),
-                                dcc.RangeSlider(id="trends-range", min=trends_min, max=trends_max, step=max((trends_max - trends_min) / 250, 0.1), value=[trends_min, trends_max]),
+                                dcc.RangeSlider(
+                                    id="trends-range",
+                                    min=trends_min,
+                                    max=trends_max,
+                                    step=max((trends_max - trends_min) / 200, 0.1),
+                                    value=[trends_min, trends_max],
+                                    marks=trends_marks,
+                                    allowCross=False,
+                                    tooltip={"placement": "bottom", "always_visible": False},
+                                ),
                             ],
                             className="panel",
                         ),
@@ -846,7 +885,8 @@ app.index_string = """
             .sidebar { padding: 18px; overflow-y: auto; border-right: 1px solid rgba(148,163,184,0.18); background: #0a1525; }
             .panel { background: #0d1b2e; border: 1px solid rgba(148,163,184,0.18); border-radius: 8px; padding: 16px; margin-bottom: 14px; }
             label { display: block; color: #c7d2e1; font-size: 12px; font-weight: 700; margin: 14px 0 8px; }
-            input { width: 100%; height: 38px; border-radius: 6px; border: 1px solid #2b3d55; background: #07111f; color: #e5eefb; padding: 0 10px; }
+            input { width: 100%; height: 38px; border-radius: 6px; border: 1px solid #b9c6d8; background: #f8fafc; color: #0f172a; padding: 0 10px; font-weight: 700; }
+            input::placeholder { color: #64748b; opacity: 1; }
             .primary-button { width: 100%; height: 42px; border: 0; border-radius: 6px; background: #38bdf8; color: #06111f; font-weight: 800; margin-top: 18px; cursor: pointer; }
             .primary-button:hover { background: #7dd3fc; }
             .status { min-height: 44px; margin-top: 12px; color: #b8c7da; font-size: 13px; line-height: 1.35; }
@@ -854,9 +894,76 @@ app.index_string = """
             .map-wrap { position: relative; min-width: 0; }
             .map { height: calc(100vh - 138px); min-height: 660px; }
             .last-update { position: absolute; right: 16px; top: 16px; padding: 9px 12px; background: rgba(7,17,31,0.78); border: 1px solid rgba(148,163,184,0.24); border-radius: 8px; color: #d7e2f0; font-size: 12px; }
-            .Select-control, .Select-menu-outer, .Select-value, .Select-placeholder { background: #07111f !important; color: #e5eefb !important; border-color: #2b3d55 !important; }
-            .rc-slider-track { background-color: #38bdf8; }
-            .rc-slider-handle { border-color: #38bdf8; background-color: #e0f2fe; }
+            .Select, .Select div, .Select span, .Select input,
+            .dash-dropdown, .dash-dropdown div, .dash-dropdown span, .dash-dropdown input {
+                color: #0f172a !important;
+            }
+            .Select-control, .Select__control {
+                background: #f8fafc !important;
+                border: 1px solid #b9c6d8 !important;
+                box-shadow: none !important;
+                min-height: 40px;
+                border-radius: 6px !important;
+            }
+            .Select-control:hover, .Select__control:hover { border-color: #38bdf8 !important; }
+            .Select-placeholder,
+            .Select--single > .Select-control .Select-value,
+            .Select__placeholder,
+            .Select__single-value {
+                color: #334155 !important;
+                line-height: 38px !important;
+                font-weight: 700 !important;
+            }
+            .Select-value-label { color: #0f172a !important; font-weight: 700 !important; }
+            .Select-input input { color: #0f172a !important; font-weight: 700 !important; }
+            .Select-menu-outer, .Select__menu {
+                background: #f8fafc !important;
+                border: 1px solid #b9c6d8 !important;
+                box-shadow: 0 12px 28px rgba(0,0,0,0.35) !important;
+                z-index: 1000 !important;
+            }
+            .Select-option, .Select__option {
+                background: #f8fafc !important;
+                color: #0f172a !important;
+                font-weight: 700 !important;
+            }
+            .Select-option.is-focused, .Select__option--is-focused {
+                background: #dbeafe !important;
+                color: #0f172a !important;
+            }
+            .Select-option.is-selected, .Select__option--is-selected {
+                background: #0e7490 !important;
+                color: #ffffff !important;
+            }
+            .Select-multi-value-wrapper .Select-value, .Select__multi-value {
+                background: #dbeafe !important;
+                border: 1px solid #38bdf8 !important;
+                color: #0f172a !important;
+                border-radius: 4px !important;
+            }
+            .Select-multi-value-wrapper .Select-value-icon { border-right-color: #38bdf8 !important; color: #0f172a !important; }
+            .Select-arrow { border-color: #0f172a transparent transparent !important; }
+            .rc-slider { margin: 8px 4px 30px; }
+            .rc-slider-mark { top: 20px; }
+            .rc-slider-mark-text {
+                color: #e2e8f0 !important;
+                font-weight: 800;
+                font-size: 11px;
+                white-space: nowrap;
+            }
+            .rc-slider-rail { background-color: #334155; height: 6px; }
+            .rc-slider-track { background-color: #38bdf8; height: 6px; }
+            .rc-slider-handle {
+                border: 3px solid #ffffff;
+                background-color: #38bdf8;
+                opacity: 1;
+                width: 18px;
+                height: 18px;
+                margin-top: -6px;
+                box-shadow: 0 0 0 2px rgba(56,189,248,0.35);
+            }
+            .rc-slider-dot { display: none; }
+            .rc-slider-tooltip { display: none !important; }
             @media (max-width: 980px) {
                 .topbar, .workspace { grid-template-columns: 1fr; }
                 .stats-grid { grid-template-columns: 1fr; }
