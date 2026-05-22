@@ -28,6 +28,10 @@ STREAMING_JOB_PATH = PROJECT_ROOT / "src" / "padelspot" / "streaming" / "club_ev
 IMPACT_RADIUS_KM = 55.0
 SCORE_DELTA_VISIBLE = 0.008
 APP_STARTED_AT = datetime.now(timezone.utc)
+COURT_CHOICES = [2, 3, 4, 5, 6, 8, 10]
+COURT_WEIGHTS = [2, 3, 4, 4, 5, 5, 4]
+EVENT_ACTIONS = ["created", "updated", "deleted"]
+EVENT_WEIGHTS = [0.64, 0.34, 0.02]
 
 
 DEPARTMENTS = [
@@ -44,7 +48,7 @@ DEPARTMENTS = [
 
 producer_state = {
     "running": False,
-    "last_message": "Pret a lancer le flux Kafka.",
+    "last_message": "Flux prêt à être lancé.",
     "created": 0,
     "updated": 0,
     "deleted": 0,
@@ -57,6 +61,8 @@ parquet_cache: dict[Path, pd.DataFrame] = {}
 parquet_cache_lock = threading.Lock()
 demo_live_clubs: dict[str, dict[str, Any]] = {}
 demo_live_lock = threading.Lock()
+base_pressure_cache: dict[str, pd.DataFrame] = {}
+base_pressure_lock = threading.Lock()
 
 
 def _default_bootstrap_servers() -> str:
@@ -186,10 +192,12 @@ def load_clubs_dataframe() -> pd.DataFrame:
     base = _normalize_base_clubs(_read_parquet(BASE_CLUBS_PATH))
     streaming_from_parquet = _normalize_streaming_clubs(_read_parquet(STREAMING_CURRENT_PATH), base)
     streaming_from_app = _normalize_streaming_clubs(_demo_live_frame(), base)
-    streaming = pd.concat([streaming_from_parquet, streaming_from_app], ignore_index=True, sort=False)
+    streaming_parts = [part for part in [streaming_from_parquet, streaming_from_app] if not part.empty]
+    streaming = pd.concat(streaming_parts, ignore_index=True, sort=False) if streaming_parts else pd.DataFrame()
     if not streaming.empty and "club_id" in streaming:
         streaming = streaming.drop_duplicates(subset=["club_id"], keep="last")
-    data = pd.concat([base, streaming], ignore_index=True, sort=False)
+    data_parts = [part for part in [base, streaming] if not part.empty]
+    data = pd.concat(data_parts, ignore_index=True, sort=False) if data_parts else pd.DataFrame()
 
     if data.empty:
         return data
@@ -199,6 +207,8 @@ def load_clubs_dataframe() -> pd.DataFrame:
     for col in [
         "nombre_de_courts",
         "score_zone_implantation",
+        "score_accessibilite_zone",
+        "ind_snv_zone",
         "prix_median_m2_zone",
         "indice_demande_trends_zone",
         "part_cible_padel_zone",
@@ -226,6 +236,77 @@ def _haversine_km(lat1: pd.Series, lon1: pd.Series, lat2: float, lon2: float) ->
     return 2 * earth_radius_km * np.arcsin(np.sqrt(a))
 
 
+def _pressure_from_competitors(
+    targets: pd.DataFrame,
+    competitors: pd.DataFrame,
+    *,
+    streaming_boost: bool,
+    exclude_same_index: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    pressure = np.zeros(len(targets), dtype=float)
+    min_distance = np.full(len(targets), np.inf)
+    target_indexes = targets.index.to_numpy()
+
+    if targets.empty or competitors.empty:
+        return pressure, min_distance
+
+    target_lat = targets["latitude"]
+    target_lon = targets["longitude"]
+
+    for competitor in competitors.itertuples():
+        lat = getattr(competitor, "latitude", np.nan)
+        lon = getattr(competitor, "longitude", np.nan)
+        if not np.isfinite(lat) or not np.isfinite(lon):
+            continue
+
+        distances = _haversine_km(target_lat, target_lon, float(lat), float(lon))
+        in_radius = distances <= IMPACT_RADIUS_KM
+        if exclude_same_index:
+            in_radius &= target_indexes != getattr(competitor, "Index")
+
+        courts = getattr(competitor, "nombre_de_courts", 2)
+        if not np.isfinite(courts):
+            courts = 2
+        courts_factor = min(max(float(courts), 1.0), 12.0) / 12.0
+        if streaming_boost:
+            intensity = 0.035 + courts_factor * 0.16
+        else:
+            intensity = 0.002 + courts_factor * 0.008
+
+        distance_factor = (1.0 - distances / IMPACT_RADIUS_KM).clip(min=0.0) ** 1.25
+        increment = np.where(in_radius, distance_factor * intensity, 0.0)
+        pressure += increment
+        min_distance = np.where(in_radius & (distances < min_distance), distances, min_distance)
+
+    return pressure, min_distance
+
+
+def _base_pressure_for_batch(batch: pd.DataFrame) -> pd.DataFrame:
+    cache_key = "|".join(batch["club_id"].astype(str).tolist())
+    with base_pressure_lock:
+        cached = base_pressure_cache.get(cache_key)
+        if cached is not None:
+            return cached.copy()
+
+    pressure, min_distance = _pressure_from_competitors(
+        batch,
+        batch.dropna(subset=["latitude", "longitude"]),
+        streaming_boost=False,
+        exclude_same_index=True,
+    )
+    result = pd.DataFrame(
+        {
+            "row_index": batch.index.to_numpy(),
+            "base_competition_pressure": np.clip(pressure, 0.0, 0.45),
+            "base_nearest_club_km": np.where(np.isfinite(min_distance), min_distance, np.nan),
+        }
+    ).set_index("row_index")
+    with base_pressure_lock:
+        base_pressure_cache.clear()
+        base_pressure_cache[cache_key] = result.copy()
+    return result
+
+
 def _apply_live_score(data: pd.DataFrame) -> pd.DataFrame:
     if data.empty:
         return data
@@ -236,33 +317,32 @@ def _apply_live_score(data: pd.DataFrame) -> pd.DataFrame:
     fallback_score = float(valid_base_scores.median()) if not valid_base_scores.empty else 0.35
     out["score_base"] = base_score.where(base_score > 0, fallback_score).fillna(fallback_score)
     out["competition_pressure"] = 0.0
+    out["event_pressure"] = 0.0
     out["distance_to_live_club_km"] = np.nan
+
+    batch = out[out["stream_source"] == "Batch"].copy()
+    if not batch.empty:
+        base_pressure = _base_pressure_for_batch(batch)
+        out.loc[base_pressure.index, "competition_pressure"] = base_pressure["base_competition_pressure"]
+        out.loc[base_pressure.index, "distance_to_live_club_km"] = base_pressure["base_nearest_club_km"]
 
     live = out[out["stream_source"] == "Streaming"].dropna(subset=["latitude", "longitude"])
     if not live.empty:
-        min_distance = np.full(len(out), np.inf)
-        pressure = np.zeros(len(out), dtype=float)
-        out_ids = out["club_id"].astype(str).to_numpy()
-
-        for _, club in live.iterrows():
-            distances = _haversine_km(out["latitude"], out["longitude"], float(club["latitude"]), float(club["longitude"]))
-            same_club = out_ids == str(club.get("club_id", ""))
-            in_radius = (distances <= IMPACT_RADIUS_KM) & ~same_club
-            courts = pd.to_numeric(pd.Series([club.get("nombre_de_courts")]), errors="coerce").fillna(2).iloc[0]
-            courts_factor = min(max(float(courts), 1.0), 12.0) / 12.0
-            intensity = 0.035 + courts_factor * 0.16
-            distance_factor = (1.0 - distances / IMPACT_RADIUS_KM).clip(min=0.0) ** 1.25
-            local_pressure = distance_factor * intensity
-            pressure += np.where(in_radius, local_pressure, 0.0)
-            min_distance = np.where(in_radius & (distances < min_distance), distances, min_distance)
-
-        out["competition_pressure"] = np.clip(pressure, 0.0, 0.45)
-        out["distance_to_live_club_km"] = np.where(np.isfinite(min_distance), min_distance, np.nan)
+        event_pressure, event_min_distance = _pressure_from_competitors(
+            out,
+            live,
+            streaming_boost=True,
+            exclude_same_index=True,
+        )
+        out["event_pressure"] = np.clip(event_pressure, 0.0, 0.45)
+        out["competition_pressure"] = np.clip(out["competition_pressure"] + out["event_pressure"], 0.0, 0.45)
+        current_distance = pd.to_numeric(out["distance_to_live_club_km"], errors="coerce").to_numpy(dtype=float)
+        out["distance_to_live_club_km"] = np.nanmin(np.vstack([current_distance, event_min_distance]), axis=0)
 
     out["score"] = (out["score_base"] - out["competition_pressure"]).clip(lower=0.02, upper=1.0)
     out["score_live"] = out["score"]
-    out["score_delta"] = -out["competition_pressure"]
-    out["score_impacted"] = out["competition_pressure"] >= SCORE_DELTA_VISIBLE
+    out["score_delta"] = -out["event_pressure"]
+    out["score_impacted"] = out["event_pressure"] >= SCORE_DELTA_VISIBLE
     return out
 
 
@@ -313,7 +393,7 @@ def _random_event(index: int, existing_clubs: list[dict[str, Any]]) -> dict[str,
     if not existing_clubs:
         action = "created"
     else:
-        action = random.choices(["created", "updated", "deleted"], weights=[0.64, 0.34, 0.02])[0]
+        action = random.choices(EVENT_ACTIONS, weights=EVENT_WEIGHTS)[0]
 
     department, city, lat, lon = _random_anchor()
     if existing_clubs and random.random() < 0.22:
@@ -324,7 +404,7 @@ def _random_event(index: int, existing_clubs: list[dict[str, Any]]) -> dict[str,
         lon = float(anchor.get("longitude") or lon)
     if action == "created":
         club_id = f"dash_live_{uuid.uuid4().hex[:8]}"
-        courts = random.choices([2, 3, 4, 5, 6, 8, 10], weights=[2, 3, 4, 4, 5, 5, 4])[0]
+        courts = random.choices(COURT_CHOICES, weights=COURT_WEIGHTS)[0]
         jitter = random.choices([0.035, 0.07, 0.12, 0.18], weights=[5, 6, 4, 2])[0]
         club_state = {
             "club_id": club_id,
@@ -349,7 +429,7 @@ def _random_event(index: int, existing_clubs: list[dict[str, Any]]) -> dict[str,
             if "name" in update_fields:
                 club_state["name"] = f"{random.choice(['Padel', 'Urban Padel', 'Padel Center', 'Padel Factory'])} {random.choice(['Nord', 'Sud', 'Est', 'Ouest', club_id[-4:].upper()])}"
             if "courts" in update_fields:
-                club_state["courts"] = random.choices([2, 3, 4, 5, 6, 8, 10], weights=[2, 3, 4, 4, 5, 5, 4])[0]
+                club_state["courts"] = random.choices(COURT_CHOICES, weights=COURT_WEIGHTS)[0]
             if "move_nearby" in update_fields:
                 club_state["latitude"] = round(float(club_state.get("latitude") or lat) + random.uniform(-0.05, 0.05), 6)
                 club_state["longitude"] = round(float(club_state.get("longitude") or lon) + random.uniform(-0.05, 0.05), 6)
@@ -414,7 +494,7 @@ def _producer_worker(event_count: int, delay: float) -> None:
         producer_state.update(
             {
                 "running": True,
-                "last_message": "Flux Kafka aleatoire en cours sur toute la France...",
+                "last_message": "Génération des événements en cours...",
                 "created": 0,
                 "updated": 0,
                 "deleted": 0,
@@ -450,10 +530,10 @@ def _producer_worker(event_count: int, delay: float) -> None:
                 )
             time.sleep(delay)
         with producer_lock:
-            producer_state["last_message"] = "Flux termine. La carte se met a jour automatiquement."
+            producer_state["last_message"] = "Flux terminé. La carte est à jour."
     except Exception as exc:
         with producer_lock:
-            producer_state["last_message"] = f"Erreur streaming: {exc}"
+            producer_state["last_message"] = f"Erreur pendant le flux: {exc}"
     finally:
         with producer_lock:
             producer_state["running"] = False
@@ -466,7 +546,7 @@ def _start_random_events(event_count: int, delay: float) -> str:
 
     thread = threading.Thread(target=_producer_worker, args=(event_count, delay), daemon=True)
     thread.start()
-    return f"Flux lance: {event_count} events Kafka."
+    return f"Flux lancé: {event_count} événements."
 
 
 def _filter_data(
@@ -475,6 +555,8 @@ def _filter_data(
     source_mode: str,
     type_mode: str,
     score_range: list[float],
+    accessibility_range: list[float],
+    socio_range: list[float],
     commune_query: str,
     zone_mode: str,
     price_range: list[float],
@@ -502,6 +584,10 @@ def _filter_data(
 
     if score_range:
         out = out[out["score_live"].between(score_range[0], score_range[1]) | out["score_live"].isna()]
+    if accessibility_range:
+        out = out[out["score_accessibilite_zone"].between(accessibility_range[0], accessibility_range[1]) | out["score_accessibilite_zone"].isna()]
+    if socio_range:
+        out = out[out["ind_snv_zone"].between(socio_range[0], socio_range[1]) | out["ind_snv_zone"].isna()]
     if commune_query:
         out = out[out["commune"].str.lower().str.contains(commune_query.lower(), na=False)]
     if zone_mode != "all":
@@ -529,12 +615,25 @@ def _numeric_bounds(data: pd.DataFrame, col: str, fallback: tuple[float, float])
     return low, high
 
 
-def _range_marks(low: float, high: float, decimals: int = 0) -> dict[float, str]:
+def _mark(label: str) -> dict[str, Any]:
+    return {
+        "label": label,
+        "style": {
+            "color": "#ffffff",
+            "fontWeight": "800",
+            "fontSize": "11px",
+            "opacity": 1,
+            "textShadow": "0 1px 2px rgba(0,0,0,0.9)",
+        },
+    }
+
+
+def _range_marks(low: float, high: float, decimals: int = 0) -> dict[float, dict[str, Any]]:
     mid = (low + high) / 2
     return {
-        low: f"{low:.{decimals}f}",
-        mid: f"{mid:.{decimals}f}",
-        high: f"{high:.{decimals}f}",
+        low: _mark(f"{low:.{decimals}f}"),
+        mid: _mark(f"{mid:.{decimals}f}"),
+        high: _mark(f"{high:.{decimals}f}"),
     }
 
 
@@ -559,11 +658,14 @@ def _display_frame(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out["courts_display"] = out["nombre_de_courts"].map(lambda value: _fmt_number(value, 0))
     out["score_display"] = out["score"].map(lambda value: _fmt_number(value, 3))
+    out["accessibility_display"] = out["score_accessibilite_zone"].map(lambda value: _fmt_number(value, 3, missing_zero=True))
+    out["socio_display"] = out["ind_snv_zone"].map(lambda value: _fmt_number(value, 0, missing_zero=True))
     out["pressure_display"] = out["competition_pressure"].map(lambda value: _fmt_number(value, 3, missing_zero=False))
+    out["event_pressure_display"] = out["event_pressure"].map(lambda value: _fmt_number(value, 3, missing_zero=False))
     out["distance_display"] = np.where(
         pd.to_numeric(out["competition_pressure"], errors="coerce").fillna(0) > 0,
         out["distance_to_live_club_km"].map(lambda value: _fmt_number(value, 1)),
-        "Aucun impact local",
+        "Aucun club proche",
     )
     out["price_display"] = out["prix_median_m2_zone"].map(lambda value: _fmt_number(value, 0, missing_zero=True))
     out["trends_display"] = out["indice_demande_trends_zone"].map(lambda value: _fmt_number(value, 1, missing_zero=True))
@@ -645,8 +747,11 @@ def _figure(df: pd.DataFrame) -> go.Figure:
                     subset_display["stream_badge"].astype(str),
                     subset_display["courts_display"],
                     subset_display["score_display"],
+                    subset_display["accessibility_display"],
+                    subset_display["socio_display"],
                     subset_display["pressure_display"],
                     subset_display["distance_display"],
+                    subset_display["event_pressure_display"],
                     subset_display["price_display"],
                     subset_display["trends_display"],
                     subset_display["event_time_display"],
@@ -669,11 +774,14 @@ def _figure(df: pd.DataFrame) -> go.Figure:
                         "Source: %{customdata[4]}<br>"
                         "Courts: %{customdata[5]}<br>"
                         "Score: %{customdata[6]}<br>"
-                        "Pression locale: %{customdata[7]}<br>"
-                        "Club live proche: %{customdata[8]}<br>"
-                        "Prix m2: %{customdata[9]}<br>"
-                        "Trends: %{customdata[10]}<br>"
-                        "Event time: %{customdata[11]}<extra></extra>"
+                        "Accessibilite: %{customdata[7]}<br>"
+                        "Socio-economie: %{customdata[8]}<br>"
+                        "Pression locale: %{customdata[9]}<br>"
+                        "Club proche: %{customdata[10]} km<br>"
+                        "Impact du flux: %{customdata[11]}<br>"
+                        "Prix m2: %{customdata[12]}<br>"
+                        "Trends: %{customdata[13]}<br>"
+                        "Event time: %{customdata[14]}<extra></extra>"
                     ),
                 )
             )
@@ -697,15 +805,21 @@ def _state_snapshot() -> dict[str, Any]:
 
 initial_data = load_clubs_dataframe()
 score_min, score_max = _numeric_bounds(initial_data, "score_live", (0.0, 1.0))
+accessibility_min, accessibility_max = _numeric_bounds(initial_data, "score_accessibilite_zone", (0.0, 1.0))
+socio_min, socio_max = _numeric_bounds(initial_data, "ind_snv_zone", (0.0, 50000.0))
 price_min, price_max = _numeric_bounds(initial_data, "prix_median_m2_zone", (0.0, 5000.0))
 trends_min, trends_max = _numeric_bounds(initial_data, "indice_demande_trends_zone", (0.0, 100.0))
 score_marks = _range_marks(score_min, score_max, 2)
+accessibility_marks = _range_marks(accessibility_min, accessibility_max, 2)
+socio_marks = _range_marks(socio_min, socio_max, 0)
 price_marks = _range_marks(price_min, price_max, 0)
 trends_marks = _range_marks(trends_min, trends_max, 0)
 all_departments = sorted(initial_data["departement_code"].dropna().astype(str).unique().tolist()) if not initial_data.empty else []
+event_count_marks = {50: _mark("50"), 500: _mark("500"), 1500: _mark("1500"), 3000: _mark("3000")}
+event_delay_marks = {0: _mark("0s"), 0.02: _mark("0.02s"), 0.2: _mark("0.2s"), 0.5: _mark("0.5s")}
 
 
-app = Dash(__name__, title="PadelSpot Streaming")
+app = Dash(__name__, title="PadelSpot - carte des clubs")
 server = app.server
 
 
@@ -723,18 +837,16 @@ app.layout = html.Div(
             [
                 html.Div(
                     [
-                        html.Div("PadelSpot Live", className="eyebrow"),
-                        html.H1("Carte streaming des clubs de padel"),
-                        html.P("Données batch enrichies par des événements Kafka traités avec Spark Structured Streaming."),
+                        html.Div("PadelSpot", className="eyebrow"),
                     ],
                     className="hero-copy",
                 ),
                 html.Div(
                     [
-                        _stat_card("Clubs visibles", "stat-visible", "apres filtres"),
-                        _stat_card("Kafka live", "stat-live", "clubs actifs"),
-                        _stat_card("Scores impactes", "stat-impacted", f"rayon {int(IMPACT_RADIUS_KM)} km"),
-                        _stat_card("Evenements", "stat-events", "session Dash"),
+                        _stat_card("Clubs visibles", "stat-visible", "après filtres"),
+                        _stat_card("Flux Kafka", "stat-live", "clubs actifs"),
+                        _stat_card("Scores impactés", "stat-impacted", f"rayon {int(IMPACT_RADIUS_KM)} km"),
+                        _stat_card("Événements", "stat-events", "session en cours"),
                     ],
                     className="stats-grid",
                 ),
@@ -747,12 +859,12 @@ app.layout = html.Div(
                     [
                         html.Section(
                             [
-                                html.H2("Flux Kafka"),
-                                html.Label("Nombre d'evenements"),
-                                dcc.Slider(id="event-count", min=50, max=3000, step=50, value=500, marks={50: "50", 500: "500", 1500: "1500", 3000: "3000"}),
-                                html.Label("Delai entre events"),
-                                dcc.Slider(id="event-delay", min=0, max=0.5, step=0.01, value=0.02, marks={0: "0s", 0.02: "0.02s", 0.2: "0.2s", 0.5: "0.5s"}),
-                                html.Button("Lancer des events aleatoires", id="start-stream", n_clicks=0, className="primary-button"),
+                                html.H2("Flux d'événements"),
+                                html.Label("Nombre d'événements"),
+                                dcc.Slider(id="event-count", min=50, max=3000, step=50, value=500, marks=event_count_marks),
+                                html.Label("Délai entre deux événements"),
+                                dcc.Slider(id="event-delay", min=0, max=0.5, step=0.01, value=0.02, marks=event_delay_marks),
+                                html.Button("Lancer le flux simulé", id="start-stream", n_clicks=0, className="primary-button"),
                                 html.Div(id="stream-status", className="status"),
                             ],
                             className="panel",
@@ -766,13 +878,13 @@ app.layout = html.Div(
                                     options=[
                                         {"label": "Toutes", "value": "all"},
                                         {"label": "Batch", "value": "Batch"},
-                                        {"label": "Kafka live", "value": "Streaming"},
+                                        {"label": "Flux Kafka", "value": "Streaming"},
                                     ],
                                     value="all",
                                     className="segmented",
                                 ),
-                                html.Label("Departements"),
-                                dcc.Dropdown(id="departments", options=[{"label": dep, "value": dep} for dep in all_departments], multi=True, placeholder="Tous les departements"),
+                                html.Label("Départements"),
+                                dcc.Dropdown(id="departments", options=[{"label": dep, "value": dep} for dep in all_departments], multi=True, placeholder="Tous les départements"),
                                 html.Label("Type"),
                                 dcc.Dropdown(
                                     id="type-mode",
@@ -793,8 +905,8 @@ app.layout = html.Div(
                                     id="zone-mode",
                                     options=[
                                         {"label": "Toutes", "value": "all"},
-                                        {"label": "Saturee", "value": "true"},
-                                        {"label": "Non saturee", "value": "false"},
+                                        {"label": "Saturée", "value": "true"},
+                                        {"label": "Non saturée", "value": "false"},
                                     ],
                                     value="all",
                                     clearable=False,
@@ -805,7 +917,7 @@ app.layout = html.Div(
                         html.Section(
                             [
                                 html.H2("Scores"),
-                                html.Label("Score implantation"),
+                                html.Label("Score d'implantation"),
                                 dcc.RangeSlider(
                                     id="score-range",
                                     min=score_min,
@@ -816,7 +928,29 @@ app.layout = html.Div(
                                     allowCross=False,
                                     tooltip={"placement": "bottom", "always_visible": False},
                                 ),
-                                html.Label("Prix median m2"),
+                                html.Label("Accessibilite"),
+                                dcc.RangeSlider(
+                                    id="accessibility-range",
+                                    min=accessibility_min,
+                                    max=accessibility_max,
+                                    step=max((accessibility_max - accessibility_min) / 200, 0.001),
+                                    value=[accessibility_min, accessibility_max],
+                                    marks=accessibility_marks,
+                                    allowCross=False,
+                                    tooltip={"placement": "bottom", "always_visible": False},
+                                ),
+                                html.Label("Socio-economie"),
+                                dcc.RangeSlider(
+                                    id="socio-range",
+                                    min=socio_min,
+                                    max=socio_max,
+                                    step=max((socio_max - socio_min) / 200, 1),
+                                    value=[socio_min, socio_max],
+                                    marks=socio_marks,
+                                    allowCross=False,
+                                    tooltip={"placement": "bottom", "always_visible": False},
+                                ),
+                                html.Label("Prix médian au m2"),
                                 dcc.RangeSlider(
                                     id="price-range",
                                     min=price_min,
@@ -846,7 +980,7 @@ app.layout = html.Div(
                 ),
                 html.Main(
                     [
-                        dcc.Graph(id="map", figure=_figure(initial_data), config={"displayModeBar": True, "scrollZoom": True}, className="map"),
+                        dcc.Graph(id="map", figure=_figure(initial_data), config={"displayModeBar": False, "scrollZoom": True}, className="map"),
                         html.Div(id="last-update", className="last-update"),
                     ],
                     className="map-wrap",
@@ -872,7 +1006,7 @@ app.index_string = """
             body { margin: 0; background: #07111f; color: #e5eefb; font-family: Inter, Segoe UI, Arial, sans-serif; }
             .app-shell { min-height: 100vh; background: #07111f; }
             .topbar { display: grid; grid-template-columns: minmax(320px, 1fr) minmax(420px, 0.85fr); gap: 24px; padding: 28px 32px 18px; border-bottom: 1px solid rgba(148,163,184,0.18); }
-            .eyebrow { color: #38bdf8; text-transform: uppercase; font-size: 12px; letter-spacing: 0; font-weight: 800; margin-bottom: 8px; }
+            .eyebrow { color: #38bdf8; text-transform: uppercase; font-size: 20px; letter-spacing: 0; font-weight: 800; margin-bottom: 8px; }
             h1 { margin: 0; font-size: 34px; line-height: 1.05; color: #f8fafc; }
             h2 { margin: 0 0 14px; font-size: 15px; color: #f8fafc; }
             p { margin: 10px 0 0; color: #9fb0c8; max-width: 760px; }
@@ -945,22 +1079,28 @@ app.index_string = """
             .Select-arrow { border-color: #0f172a transparent transparent !important; }
             .rc-slider { margin: 8px 4px 30px; }
             .rc-slider-mark { top: 20px; }
-            .rc-slider-mark-text {
-                color: #e2e8f0 !important;
+            .panel .rc-slider-mark-text,
+            .panel .rc-slider-mark-text-active,
+            .rc-slider-mark-text,
+            .rc-slider-mark-text-active {
+                color: #ffffff !important;
+                fill: #ffffff !important;
                 font-weight: 800;
                 font-size: 11px;
                 white-space: nowrap;
+                opacity: 1 !important;
+                text-shadow: 0 1px 2px rgba(0,0,0,0.85);
             }
-            .rc-slider-rail { background-color: #334155; height: 6px; }
-            .rc-slider-track { background-color: #38bdf8; height: 6px; }
+            .panel .rc-slider-rail { background-color: #475569; height: 6px; }
+            .panel .rc-slider-track { background-color: #a855f7; height: 6px; }
             .rc-slider-handle {
                 border: 3px solid #ffffff;
-                background-color: #38bdf8;
+                background-color: #8b5cf6;
                 opacity: 1;
                 width: 18px;
                 height: 18px;
                 margin-top: -6px;
-                box-shadow: 0 0 0 2px rgba(56,189,248,0.35);
+                box-shadow: 0 0 0 2px rgba(255,255,255,0.35);
             }
             .rc-slider-dot { display: none; }
             .rc-slider-tooltip { display: none !important; }
@@ -1006,6 +1146,8 @@ def start_stream(n_clicks: int, event_count: int, delay: float) -> str:
     Input("source-mode", "value"),
     Input("type-mode", "value"),
     Input("score-range", "value"),
+    Input("accessibility-range", "value"),
+    Input("socio-range", "value"),
     Input("commune", "value"),
     Input("zone-mode", "value"),
     Input("price-range", "value"),
@@ -1018,6 +1160,8 @@ def refresh_map(
     source_mode: str,
     type_mode: str,
     score_range: list[float],
+    accessibility_range: list[float],
+    socio_range: list[float],
     commune_query: str,
     zone_mode: str,
     price_range: list[float],
@@ -1030,6 +1174,8 @@ def refresh_map(
         source_mode,
         type_mode,
         score_range,
+        accessibility_range,
+        socio_range,
         commune_query or "",
         zone_mode,
         price_range,

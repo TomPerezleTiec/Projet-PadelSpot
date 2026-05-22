@@ -18,6 +18,8 @@ DEPARTMENTS = [
     ("13", "Marseille", 43.296, 5.369),
     ("44", "Nantes", 47.218, -1.553),
 ]
+COURT_CHOICES = [2, 3, 4, 5, 6, 8, 10]
+COURT_WEIGHTS = [2, 3, 4, 4, 5, 5, 4]
 
 
 def _now_iso() -> str:
@@ -25,10 +27,10 @@ def _now_iso() -> str:
 
 
 def _event(index: int, existing_clubs: list[str]) -> dict:
-    if not existing_clubs or random.random() < 0.55:
+    if not existing_clubs or random.random() < 0.64:
         action = "created"
     else:
-        action = random.choices(["updated", "deleted"], weights=[0.75, 0.25])[0]
+        action = random.choices(["updated", "deleted"], weights=[0.94, 0.06])[0]
 
     department, city, lat, lon = random.choice(DEPARTMENTS)
 
@@ -56,7 +58,7 @@ def _event(index: int, existing_clubs: list[str]) -> dict:
                 "department": department,
                 "latitude": round(lat + random.uniform(-0.05, 0.05), 6),
                 "longitude": round(lon + random.uniform(-0.05, 0.05), 6),
-                "courts": random.randint(2, 12),
+                "courts": random.choices(COURT_CHOICES, weights=COURT_WEIGHTS)[0],
             }
         )
 
